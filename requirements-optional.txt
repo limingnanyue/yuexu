@@ -1,0 +1,12 @@
+# Optional dependencies. When missing, the related feature degrades gracefully.
+# pip install -r requirements-optional.txt
+
+# TTS voice (falls back to text-only replies if absent)
+edge-tts>=6.1.10
+
+# 长期向量记忆 - Chroma 持久化引擎（未安装时自动使用零依赖 builtin 内存向量引擎）
+# 注意：1.x 版本的 Rust 绑定在部分 Windows 环境无法打开持久化数据库，建议 0.6.x
+chromadb>=0.6.0,<1.0
+
+# PostgreSQL driver (Linux / Docker deployments only)
+asyncpg>=0.29.0

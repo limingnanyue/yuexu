@@ -1,0 +1,20 @@
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: yuexu-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      YUEXU_CONFIG: /app/config.yaml
+    network_mode: host
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./static:/app/static
+      - /var/run/docker.sock:/var/run/docker.sock

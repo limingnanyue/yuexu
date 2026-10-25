@@ -1,0 +1,68 @@
+# ===== 敏感配置（只保留模板）=====
+config.yaml
+.env
+.env.*
+!.env.example
+!config_example.yaml
+deploy/docker/.env
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+pip-*/
+
+# ===== 前端 =====
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.tmp/
+frontend/.env.local
+*.local
+
+# ===== 运行时数据 =====
+data/*
+!data/.gitkeep
+data/backups/
+data/chroma_db/
+chroma_db/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+logs/*
+!logs/.gitkeep
+*.log
+static/voice_cache/*
+!static/voice_cache/.gitkeep
+static/qrcode_temp/*
+!static/qrcode_temp/.gitkeep
+static/emoji_lib/*
+!static/emoji_lib/.gitkeep
+static/image_cache/
+
+# ===== 打包与临时产物 =====
+dist/
+build/
+*.exe
+*.zip
+.tmp/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== 本地调试 =====
+debug_*
+tmp_*

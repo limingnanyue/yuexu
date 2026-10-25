@@ -1,0 +1,329 @@
+# ============================================================
+# 《月叙》AI 多端智能对话机器人 - 配置模板
+# 使用方法：复制为 config.yaml 后填写真实密钥
+#   copy config_example.yaml config.yaml     (Windows)
+#   cp   config_example.yaml config.yaml     (Linux)
+# 注意：config.yaml 已被 .gitignore 忽略，禁止提交到仓库
+# 支持环境变量占位：${VAR} 或 ${VAR:-默认值}
+# ============================================================
+
+app:
+  name: "月叙"
+  version: "0.1.0"
+  env: "dev"                       # dev / prod
+  host: "0.0.0.0"
+  port: 8000
+  debug: true
+  # 前端开发服务器跨域白名单
+  cors_origins:
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+
+database:
+  # Windows 本地：SQLite；Linux：postgresql+asyncpg://user:pass@db:5432/yuexu
+  url: "sqlite+aiosqlite:///./data/yuexu.db"
+  echo: false
+
+redis:
+  # 关闭后使用内存缓存；会话原文仍保存于数据库，重启后自动恢复
+  enabled: false
+  url: "redis://127.0.0.1:6379/0"
+  key_prefix: "yuexu:"
+  # 上下文缓存 TTL（秒），过期后从数据库恢复，不删除历史
+  context_ttl: 600
+  # 工作窗口轮数；0 按模型容量自动保留，超限滚动摘要且保留原文归档
+  context_max_rounds: 0
+  # 限流计数窗口（秒）
+  rate_window: 60
+
+security:
+  # 生产环境务必修改，建议使用 32 位以上随机字符串
+  jwt_secret: "change-me-yuexu-jwt-secret-please"
+  jwt_algorithm: "HS256"
+  jwt_expire_minutes: 720
+  # 首次启动自动创建的超管账号
+  admin:
+    username: "admin"
+    password: "admin123"
+    nickname: "管理员"
+
+dispatch:
+  # 触发策略
+  private_enabled: true
+  group_at_enabled: true
+  group_keyword_enabled: true
+  group_keywords: ["月叙", "yuexu", "月月"]
+  # 群聊中 @ 以外的消息是否需要唤醒词
+  group_require_wakeup: true
+  # 上下文连续对话总开关（关闭后为一问一答模式）
+  context_enabled: true
+  # 后台任务队列容量与并发 worker 数（记忆抽取等异步任务背压）
+  queue_size: 200
+  background_workers: 4
+  # LLM 失败兜底话术
+  fallback_reply: "……刚刚走神了一下，你再发一次好不好？"
+
+llm:
+  default_model_id: null
+  # 备用模型 ID：主模型超时/网络失败重试一次后仍失败时切换（留空关闭）
+  fallback_model_id: null
+  timeout: 60
+  # 思维引导：在人设后追加「先理解意图与情绪再回应」的提示（推理模型的
+  # reasoning_content / <think> 思考过程会自动剥离，不会发给用户）
+  thinking_hint: true
+  # 上下文 + 记忆总字符上限；0 根据模型窗口扣除输出后自动计算（未知容量为6000）
+  context_char_budget: 0
+  # 是否把搜索结果注入到 prompt
+  inject_search_context: true
+
+search:
+  enabled: false
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com"
+  endpoint: "/v1/search"
+  api_key: "${DEEPSEEK_SEARCH_KEY:-}"
+  top_k: 5
+  max_summary_chars: 1500
+  timeout: 15
+  # 自动识别时效类问题触发搜索
+  auto_trigger: true
+  # 命中以下关键词视为时效类问题
+  freshness_keywords: ["今天", "现在", "最新", "新闻", "天气", "股价", "汇率", "最近", "本周", "今年"]
+
+tts:
+  enabled: true
+  # edge / openai（OpenAI 兼容）/ minimax（MiniMax 原生语音接口）
+  engine: "edge"
+  # MiniMax 使用 https://api.minimax.cn/v1，模型如 speech-2.8-hd，cloud_voice 填 voice_id
+  base_url: "https://api.openai.com/v1"
+  api_key: "${YUEXU_TTS_API_KEY:-}"
+  model: ""
+  cloud_voice: "alloy"
+  # OpenAI 兼容：0.25–4；MiniMax：0.5–2
+  speed: 1.0
+  timeout: 60
+  voice: "zh-CN-XiaoxiaoNeural"
+  rate: "+0%"
+  volume: "+0%"
+  cache_dir: "static/voice_cache"
+  cache_ttl_hours: 24
+  max_chars: 200
+  # 触发策略：auto（按聊天意图与回复内容判断）/ never / at_only / always
+  trigger: "auto"
+
+voice_call:
+  # 月叙自有 PCM 接入协议，需要真实 QQ 通话桥；普通 NapCat 未公开音频接口。
+  enabled: false
+  # 仅通话覆盖 MiniMax 模型，例如 speech-2.8-turbo；留空复用普通语音模型。
+  tts_model: null
+  asr_url: "http://127.0.0.1:50000/api/v1/asr"
+  asr_timeout: 15
+  # 16 kHz / 16-bit / mono；能量阈值须按实际麦克风和底噪调节。
+  energy_threshold: 500
+  silence_ms: 600
+  min_speech_ms: 200
+  max_utterance_ms: 15000
+  max_call_seconds: 600
+
+image_generation:
+  enabled: false
+  # 兼容 OpenAI Images API，地址填到 /v1，模型名由服务商提供
+  base_url: "https://api.openai.com/v1"
+  api_key: "${YUEXU_IMAGE_API_KEY:-}"
+  model: ""
+  size: "1024x1024"
+  timeout: 120
+  cache_dir: "static/image_cache"
+  cache_ttl_hours: 24
+
+vitality:
+  # 活力 Agent：会话静默后无聊分升高，达到动态阈值时主动搭话；
+  # 用户回复热情阈值自动下调（更容易触发）、冷淡自动上调（更难触发）
+  enabled: false
+  # 轮询间隔（秒）
+  interval: 60
+  # 基础无聊分阈值（0-100）：新会话初始值，之后自适应演化
+  base_threshold: 60
+  # 自适应阈值锁死区间
+  threshold_min: 40
+  threshold_max: 90
+  # 冷却（分钟）：距上一条消息或上次主动搭话的最小间隔，私聊 / 群聊分开
+  private_cooldown_minutes: 45
+  group_cooldown_minutes: 120
+  # 单会话每小时最多主动搭话次数
+  max_hour_sends: 2
+  # 活跃时段（HH:MM-HH:MM，支持跨零点）：时段外不主动发消息
+  active_window: "09:00-23:00"
+  # 无回复判定窗口（分钟）：超时未回复按 none 回填并小幅上调阈值
+  reply_window_minutes: 60
+  # 每轮轮询最多发送的会话数（防止集中打扰）
+  max_sends_per_tick: 3
+
+emoji:
+  enabled: true
+  lib_dir: "static/emoji_lib"
+  default_weight: 1
+  # LLM 输出标签形如 [开心] 时替换为表情
+  tag_pattern: "\\[([^\\[\\]]{1,8})\\]"
+
+emotion:
+  # 情感系统总开关：每段关系独立的心情 / 好感 / 信任 / 动态，随对话演化并注入 Prompt
+  enabled: true
+  # 更新方式：llm（每轮对话后用模型静默输出增量，更细腻）/ heuristic（关键词启发式，零额外开销）
+  mode: "llm"
+  # LLM 更新超时（秒），超时自动回退启发式
+  update_timeout: 10
+
+memory:
+  enabled: true
+  # 向量引擎：builtin（零依赖内存语义检索，默认）/ chroma（本地持久化，需 pip install chromadb）
+  # / keyword（SQL LIKE 关键词降级）；qdrant 通过扩展接口接入
+  backend: "builtin"
+  chroma_dir: "data/chroma_db"
+  chroma_collection: "yuexu_memory"
+
+  # ---------- 中文语义向量化（检索质量核心，切换后自动重建索引） ----------
+  embedding:
+    # builtin：内置零依赖中文字符级向量（默认，开箱即用）
+    # onnx：本地 ONNX 中文模型（需 pip install onnxruntime，模型目录含 model.onnx + vocab.txt）
+    # api：OpenAI 兼容 /embeddings 接口（如硅基流动 bge 系列）
+    provider: "builtin"
+    # builtin 向量维度（onnx/api 由模型决定，无需填写）
+    dim: 512
+    # onnx 模型目录（相对项目根）
+    model_path: "data/embedding_models/bge-small-zh"
+    # api 接入配置（provider=api 时必填）
+    api_base_url: ""                # 例如 https://api.siliconflow.cn/v1
+    api_key: "${YUEXU_EMBEDDING_API_KEY:-}"
+    api_model: ""                   # 例如 BAAI/bge-large-zh-v1.5
+    api_timeout: 10
+    api_batch: 16
+
+  # HNSW 索引参数（4.5.7）：search_ef 越小越快
+  hnsw_construction_ef: 128
+  hnsw_search_ef: 48
+  top_k: 5
+  # 粗召回候选数（多拿少留），最终按重排截断
+  coarse_top_k: 8
+  # 记忆抽取最小间隔（秒），0 = 每轮对话后都抽取
+  extract_interval: 0
+  # 单条记忆最大长度
+  max_entry_chars: 500
+  # 注入 Prompt 的记忆字符预算（按上下文剩余空间动态截断）
+  max_prompt_chars: 900
+
+  # ---------- 双检索模式（4.5.4） ----------
+  fuzzy_enabled: true
+  precise_threshold: 0.7
+  fuzzy_threshold: 0.5
+  precise_max_fuzzy_weight: 0.5
+  fuzzy_keywords: ["好像", "似乎", "记得一点", "有点印象", "忘了", "想不起来", "之前", "上次", "以前", "印象中", "还记得"]
+  # LLM 语义二次确认（默认关闭，避免增加对话延迟）
+  fuzzy_llm_confirm: false
+
+  # ---------- 多级召回（4.5.5） ----------
+  recall_cache_ttl: 600
+  rerank_enabled: true
+  rerank_weights:
+    similarity: 0.6
+    hot: 0.15
+    confidence: 0.15
+    keyword: 0.1
+  # MMR 多样性重排（0~1）：注入 Prompt 的记忆在同等预算内覆盖更多不同事实；
+  # 越小越注重新颖性，≥1 退化为纯相关性排序（仅硬去重）
+  mmr_lambda: 0.7
+  # 检索超时（毫秒）与熔断（4.5.9）
+  precise_timeout_ms: 400
+  fuzzy_timeout_ms: 700
+  breaker_failures: 3
+  breaker_cooldown: 60
+  max_concurrency: 2
+
+  # ---------- 冷热分层与热度（4.5.3） ----------
+  hot_days: 7
+  warm_days: 30
+  hot_score_init: 5.0
+  hot_hit_boost: 1.0
+  denied_penalty: 1.5
+  hot_decay: 0.92
+  # 用户确认 / 否认的自动识别（仅上一轮为模糊召回时生效）
+  feedback_auto: true
+
+  # ---------- 写入优化（4.5.6） ----------
+  write_async: true
+  llm_extract: true
+  extract_timeout: 8
+  dedupe_threshold: 0.9
+
+  # ---------- 维护（4.5.10） ----------
+  auto_purge_cold: false
+  cold_purge_days: 180
+  cold_purge_hot_below: 0.5
+  maintenance_batch: 500
+
+  # ---------- 共享记忆分区 ----------
+  # 群共享记忆：群聊抽取的事实同步写入群分区（target_type=group），
+  # 群内所有成员的对话都可召回；关闭后群聊只保留「用户×群」私有分区
+  group_shared_enabled: true
+  # 群聊事实是否自动双写到群共享分区（写入量约翻倍，查重按分区独立）
+  group_shared_extract: true
+  # 全局记忆：对机器人全部会话可见的共享分区（target_type=global，后台手动维护）
+  global_enabled: true
+
+rate_limit:
+  enabled: true
+  per_user_per_minute: 12
+  per_group_per_minute: 40
+  per_account_per_minute: 60
+  # 自动推送更严格
+  push_per_minute: 5
+  push_daily_limit: 50
+  # 发送随机延时（秒）
+  random_delay_min: 0.3
+  random_delay_max: 1.2
+
+scheduler:
+  # 过期上下文清理间隔（秒）
+  context_cleanup_interval: 300
+  # 语音缓存清理间隔（秒）
+  voice_cleanup_interval: 3600
+  # 数据库自动备份间隔（小时），0 表示关闭
+  backup_interval_hours: 24
+  backup_dir: "data/backups"
+  backup_keep: 7
+  # 日志保留天数
+  log_retention_days: 30
+
+adapters:
+  reconnect_interval: 15
+  max_reconnect_attempts: 10
+  # NapCat OneBot11 HTTP 服务地址（账号表未单独配置时使用）
+  napcat:
+    # auto：Windows x64 使用原生包；Linux（宿主机 Python / Docker）使用本机 Docker Engine
+    runtime: "${YUEXU_NAPCAT_RUNTIME:-auto}"
+    # 可配置多个可信 HTTPS 完整包地址，按顺序尝试，最后回退官方；所有源仍校验固定 SHA256
+    download_urls:
+      - "${YUEXU_NAPCAT_DOWNLOAD_URL:-}"
+    offline_archive: "${YUEXU_NAPCAT_OFFLINE_ARCHIVE:-}"
+    docker:
+      socket: "${YUEXU_DOCKER_SOCKET:-/var/run/docker.sock}"
+      image: "${YUEXU_NAPCAT_IMAGE:-mlikiowa/napcat-docker:v4.18.41@sha256:b101b8968cc31ae428ec0f8e117386e4ced7773b2d8226ed9f7ddfcec55f1b7e}"
+    base_url: "http://127.0.0.1:3000"
+    token: ""
+    webui_url: "http://127.0.0.1:6099"
+    webui_token: ""                 # NapCat 管理面板 Token，与 OneBot token 不同
+  # Gewechat HTTP 服务地址
+  gewechat:
+    base_url: "http://127.0.0.1:2531/v2/api"
+    token: ""
+    app_id: ""
+  qq_bot:
+    base_url: "https://api.bot.qq.com"
+  clawbot:
+    base_url: "https://ilinkai.weixin.qq.com"
+
+paths:
+  static_dir: "static"
+  data_dir: "data"
+  log_dir: "logs"
+  frontend_dist: "frontend/dist"

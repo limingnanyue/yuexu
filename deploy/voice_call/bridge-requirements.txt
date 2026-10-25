@@ -1,0 +1,5 @@
+# 独立通话音频连接器，不安装到主后端环境。
+httpx>=0.27,<1
+pydantic>=2.9,<3
+websockets>=13
+sounddevice>=0.5.1,<0.6

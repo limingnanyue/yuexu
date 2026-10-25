@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: yuexu-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      YUEXU_CONFIG: /app/config.yaml
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./static:/app/static
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - yuexu
+
+  redis:
+    image: redis:7-alpine
+    container_name: yuexu-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis-data:/data
+    networks:
+      - yuexu
+
+  # 可选：需要 PostgreSQL 时启用（同时修改 config.yaml 的 database.url）
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: yuexu-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: yuexu
+  #     POSTGRES_USER: yuexu
+  #     POSTGRES_PASSWORD: change-me
+  #   volumes:
+  #     - ./pg-data:/var/lib/postgresql/data
+  #   networks:
+  #     - yuexu
+
+networks:
+  yuexu:
+    driver: bridge

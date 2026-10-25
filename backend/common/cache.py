@@ -1,0 +1,343 @@
+"""缓存抽象层：Redis 优先，异常 / 未启用时自动降级为进程内缓存。
+
+- 启动时 Redis 不可用 → 直接使用内存缓存；
+- 运行中 Redis 连接异常 → ``FailoverCache`` 自动切换内存缓存并后台探测重连，
+  恢复后自动切回（文档 10.8：会话缓存异常不阻断对话）；
+- ``incr`` 使用 Lua 脚本保证 INCR + EXPIRE 原子性，避免计数器永不过期。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fnmatch
+import json
+import logging
+import time
+from abc import ABC, abstractmethod
+from typing import Any
+
+logger = logging.getLogger("yuexu.cache")
+
+
+class CacheBackend(ABC):
+    """缓存后端抽象接口。"""
+
+    name: str = "base"
+
+    def __init__(self, prefix: str = "") -> None:
+        self.prefix = prefix or ""
+
+    def _key(self, key: str) -> str:
+        return f"{self.prefix}{key}"
+
+    # -- 基础 KV ---------------------------------------------------------
+    @abstractmethod
+    async def get(self, key: str) -> str | None: ...
+
+    @abstractmethod
+    async def set(self, key: str, value: str, ttl: int | None = None) -> None: ...
+
+    @abstractmethod
+    async def delete(self, *keys: str) -> None: ...
+
+    @abstractmethod
+    async def exists(self, key: str) -> bool: ...
+
+    @abstractmethod
+    async def incr(self, key: str, ttl: int | None = None) -> int: ...
+
+    @abstractmethod
+    async def keys(self, pattern: str = "*") -> list[str]: ...
+
+    @abstractmethod
+    async def ttl(self, key: str) -> int: ...
+
+    @abstractmethod
+    async def close(self) -> None: ...
+
+    # -- 批量便捷方法（Redis 实现用 pipeline，默认逐个执行） ---------------
+    async def get_many(self, keys: list[str]) -> list[str | None]:
+        if not keys:
+            return []
+        return [await self.get(key) for key in keys]
+
+    async def ttl_many(self, keys: list[str]) -> list[int]:
+        if not keys:
+            return []
+        return [await self.ttl(key) for key in keys]
+
+    # -- JSON 便捷方法 ---------------------------------------------------
+    async def get_json(self, key: str, default: Any = None) -> Any:
+        raw = await self.get(key)
+        if raw is None:
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning("缓存值不是合法 JSON，key=%s", key)
+            return default
+
+    async def set_json(self, key: str, value: Any, ttl: int | None = None) -> None:
+        await self.set(key, json.dumps(value, ensure_ascii=False), ttl=ttl)
+
+
+class MemoryCache(CacheBackend):
+    """进程内 TTL 缓存，用于无 Redis 的本地调试场景。"""
+
+    name = "memory"
+
+    def __init__(self, prefix: str = "") -> None:
+        super().__init__(prefix)
+        self._store: dict[str, tuple[str, float | None]] = {}
+
+    def _purge(self) -> None:
+        current = time.time()
+        expired = [
+            key for key, (_, deadline) in self._store.items()
+            if deadline is not None and deadline <= current
+        ]
+        for key in expired:
+            self._store.pop(key, None)
+
+    async def get(self, key: str) -> str | None:
+        self._purge()
+        item = self._store.get(self._key(key))
+        return item[0] if item else None
+
+    async def set(self, key: str, value: str, ttl: int | None = None) -> None:
+        deadline = time.time() + ttl if ttl and ttl > 0 else None
+        self._store[self._key(key)] = (value, deadline)
+
+    async def delete(self, *keys: str) -> None:
+        for key in keys:
+            self._store.pop(self._key(key), None)
+
+    async def exists(self, key: str) -> bool:
+        return await self.get(key) is not None
+
+    async def incr(self, key: str, ttl: int | None = None) -> int:
+        self._purge()
+        full_key = self._key(key)
+        raw, deadline = self._store.get(full_key, (None, None))
+        value = int(raw or 0) + 1
+        if deadline is None and ttl and ttl > 0:
+            deadline = time.time() + ttl
+        self._store[full_key] = (str(value), deadline)
+        return value
+
+    async def keys(self, pattern: str = "*") -> list[str]:
+        self._purge()
+        full_pattern = self._key(pattern)
+        return [
+            key[len(self.prefix):] for key in self._store
+            if fnmatch.fnmatch(key, full_pattern)
+        ]
+
+    async def ttl(self, key: str) -> int:
+        item = self._store.get(self._key(key))
+        if not item or item[1] is None:
+            return -1
+        return max(int(item[1] - time.time()), 0)
+
+    async def close(self) -> None:
+        self._store.clear()
+
+
+class RedisCache(CacheBackend):
+    """Redis 异步缓存实现。"""
+
+    name = "redis"
+
+    # Lua：INCR 与首次 EXPIRE 原子执行，杜绝两步竞态导致的永不过期计数器
+    _INCR_LUA = (
+        "local v = redis.call('INCR', KEYS[1]) "
+        "if v == 1 and ARGV[1] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[1]) end "
+        "return v"
+    )
+
+    def __init__(self, url: str, prefix: str = "") -> None:
+        super().__init__(prefix)
+        import redis.asyncio as redis  # 延迟导入，便于无 Redis 环境运行
+
+        self._client = redis.from_url(
+            url,
+            decode_responses=True,
+            max_connections=50,
+            socket_timeout=5,
+            socket_connect_timeout=3,
+            health_check_interval=30,
+            retry_on_timeout=True,
+        )
+
+    async def ping(self) -> bool:
+        return bool(await self._client.ping())
+
+    async def get(self, key: str) -> str | None:
+        return await self._client.get(self._key(key))
+
+    async def set(self, key: str, value: str, ttl: int | None = None) -> None:
+        if ttl and ttl > 0:
+            await self._client.set(self._key(key), value, ex=ttl)
+        else:
+            await self._client.set(self._key(key), value)
+
+    async def delete(self, *keys: str) -> None:
+        if keys:
+            await self._client.delete(*(self._key(key) for key in keys))
+
+    async def exists(self, key: str) -> bool:
+        return bool(await self._client.exists(self._key(key)))
+
+    async def incr(self, key: str, ttl: int | None = None) -> int:
+        full_key = self._key(key)
+        value = await self._client.eval(
+            self._INCR_LUA, 1, full_key, str(int(ttl)) if ttl and ttl > 0 else ""
+        )
+        return int(value)
+
+    async def keys(self, pattern: str = "*") -> list[str]:
+        found: list[str] = []
+        async for key in self._client.scan_iter(match=self._key(pattern), count=200):
+            found.append(key[len(self.prefix):] if self.prefix else key)
+        return found
+
+    async def ttl(self, key: str) -> int:
+        return int(await self._client.ttl(self._key(key)))
+
+    async def get_many(self, keys: list[str]) -> list[str | None]:
+        if not keys:
+            return []
+        pipe = self._client.pipeline(transaction=False)
+        for key in keys:
+            pipe.get(self._key(key))
+        return list(await pipe.execute())
+
+    async def ttl_many(self, keys: list[str]) -> list[int]:
+        if not keys:
+            return []
+        pipe = self._client.pipeline(transaction=False)
+        for key in keys:
+            pipe.ttl(self._key(key))
+        return [int(value) for value in await pipe.execute()]
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class FailoverCache(CacheBackend):
+    """Redis 主缓存 + 内存兜底：运行中连接故障自动降级、恢复后切回。"""
+
+    name = "redis"
+
+    _DIRECT = {"get", "set", "delete", "exists", "incr", "keys", "ttl", "get_many", "ttl_many"}
+
+    def __init__(
+        self, primary: RedisCache, fallback: MemoryCache, probe_interval: float = 10.0
+    ) -> None:
+        super().__init__(primary.prefix)
+        self._primary = primary
+        self._fallback = fallback
+        self._degraded = False
+        self._probe_interval = max(3.0, float(probe_interval))
+        self._probe_task: asyncio.Task | None = None
+
+    async def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if not self._degraded:
+            try:
+                return await getattr(self._primary, method)(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_connection_error(exc):
+                    raise
+                self._degrade(exc)
+        return await getattr(self._fallback, method)(*args, **kwargs)
+
+    @staticmethod
+    def _is_connection_error(exc: BaseException) -> bool:
+        try:
+            import redis.exceptions as redis_exc
+        except ImportError:  # pragma: no cover - 无 Redis 环境不会构造本类
+            return isinstance(exc, (ConnectionError, OSError))
+        return isinstance(
+            exc,
+            (redis_exc.ConnectionError, redis_exc.TimeoutError, ConnectionError, OSError),
+        )
+
+    def _degrade(self, exc: BaseException) -> None:
+        self._degraded = True
+        logger.warning("Redis 连接异常（%s），缓存已降级为进程内缓存", exc)
+        if self._probe_task is None or self._probe_task.done():
+            self._probe_task = asyncio.get_running_loop().create_task(
+                self._probe_loop(), name="yuexu-cache-reconnect"
+            )
+
+    async def _probe_loop(self) -> None:
+        while self._degraded:
+            await asyncio.sleep(self._probe_interval)
+            try:
+                if await self._primary.ping():
+                    self._degraded = False
+                    logger.info("Redis 连接已恢复，缓存切回主实例")
+                    return
+            except Exception:  # noqa: BLE001 - 继续探测
+                continue
+
+    async def ping(self) -> bool:
+        if self._degraded:
+            return False
+        return await self._primary.ping()
+
+    async def get(self, key: str) -> str | None:
+        return await self._call("get", key)
+
+    async def set(self, key: str, value: str, ttl: int | None = None) -> None:
+        await self._call("set", key, value, ttl=ttl)
+
+    async def delete(self, *keys: str) -> None:
+        await self._call("delete", *keys)
+
+    async def exists(self, key: str) -> bool:
+        return await self._call("exists", key)
+
+    async def incr(self, key: str, ttl: int | None = None) -> int:
+        return await self._call("incr", key, ttl=ttl)
+
+    async def keys(self, pattern: str = "*") -> list[str]:
+        return await self._call("keys", pattern)
+
+    async def ttl(self, key: str) -> int:
+        return await self._call("ttl", key)
+
+    async def get_many(self, keys: list[str]) -> list[str | None]:
+        return await self._call("get_many", keys)
+
+    async def ttl_many(self, keys: list[str]) -> list[int]:
+        return await self._call("ttl_many", keys)
+
+    async def close(self) -> None:
+        if self._probe_task is not None and not self._probe_task.done():
+            self._probe_task.cancel()
+            try:
+                await self._probe_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await self._fallback.close()
+        await self._primary.close()
+
+
+async def init_cache(
+    enabled: bool,
+    url: str = "redis://127.0.0.1:6379/0",
+    prefix: str = "yuexu:",
+) -> CacheBackend:
+    """创建缓存后端；Redis 不可用时降级为内存缓存（文档 10.8）。"""
+    if enabled:
+        try:
+            primary = RedisCache(url, prefix=prefix)
+            await primary.ping()
+            logger.info("Redis 连接成功：%s", url)
+            return FailoverCache(primary, MemoryCache(prefix=prefix))
+        except Exception as exc:  # noqa: BLE001 - 任意连接异常都降级
+            logger.warning("Redis 不可用（%s），已降级为内存缓存", exc)
+    else:
+        logger.info("Redis 未启用，使用内存缓存（会话原文由数据库持久保存）")
+    return MemoryCache(prefix=prefix)
