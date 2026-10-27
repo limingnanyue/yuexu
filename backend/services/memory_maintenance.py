@@ -16,7 +16,6 @@ from typing import Any
 
 from backend.common.logger import get_logger
 from backend.common.utils import chunked
-from backend.database.models import MemoryEntry
 from backend.repositories.memory_repo import MemoryRepo
 from backend.repositories.vector_store import VectorStore
 from backend.services.memory_support import metadata_from_entry, similarity
@@ -47,7 +46,13 @@ def _compute_duplicates(
         for entry_id, content, _category, rejected in group:
             if rejected:
                 continue
-            if any(similarity(content, other) >= 0.92 for _other_id, other in kept):
+            # threshold 只做剪枝：Jaccard 已达标或长度上界不足时跳过昂贵的
+            # SequenceMatcher，判定结果与不传 threshold 完全一致（已由
+            # memory_algorithm_upgrade_test 的剪枝一致性用例覆盖）。
+            if any(
+                similarity(content, other, threshold=0.92) >= 0.92
+                for _other_id, other in kept
+            ):
                 duplicate_ids.append(entry_id)
             else:
                 kept.append((entry_id, content))
@@ -158,7 +163,8 @@ async def rebuild_index(
         indexed_ids = await vector.list_ids(
             {"bot_id": bot_id} if bot_id else None
         )
-        orphans = [item for item in indexed_ids if item not in set(db_ids)]
+        db_id_set = set(db_ids)  # 提到循环外：写在推导式里是 O(n²)，大库重建会卡死事件循环
+        orphans = [item for item in indexed_ids if item not in db_id_set]
         for chunk in chunked(orphans, 500):
             await vector.delete(list(chunk))
     except Exception:  # noqa: BLE001

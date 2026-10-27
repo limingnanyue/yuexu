@@ -295,6 +295,7 @@ class BotDispatchService:
 
             # 7. 长期记忆召回与搜索并行：双模式召回 + 动态字符预算
             references: list[str] = []
+            recall_ids: list[str] = []
             memory_task: asyncio.Task | None = None
             if memory_enabled:
                 search_reserve = 0
@@ -347,8 +348,9 @@ class BotDispatchService:
                 recall_result = await memory_task
                 if recall_result.prompt:
                     references.append(recall_result.prompt)
-                # 记录本轮召回，供用户“对/不对”反馈时转正或屏蔽
+                # 记录本轮召回，供用户“对/不对”反馈时转正或屏蔽，也用于召回热度回馈
                 if recall_result.prompt and recall_result.hits:
+                    recall_ids = list(recall_result.ids)
                     await self.contexts.set_last_recall(
                         event.session_key(),
                         {
@@ -520,6 +522,20 @@ class BotDispatchService:
                 ),
                 name=f"yuexu-ctx-{event.bot_id}",
                 critical=True,
+            )
+
+        # 13.1 召回热度回馈（后台异步）：本轮注入的记忆被成功使用后小幅升热，
+        # 让「经常被想起」的记忆自然进入热层并提高后续排序；限频在
+        # MemoryService.reinforce 内部完成，模型失败时不回馈。
+        if (
+            reply.success
+            and memory_enabled
+            and recall_ids
+            and self.config.get("memory.recall_reinforce", True)
+        ):
+            spawn(
+                self._post_recall_reinforce(recall_ids, event.bot_id),
+                name=f"yuexu-memhit-{event.bot_id}",
             )
 
         # 15. 情感演化：依据这轮对话更新心情 / 好感 / 信任 / 动态（后台异步）
@@ -820,6 +836,14 @@ class BotDispatchService:
                     await MemoryService(session).extract_and_store(event, user_text, assistant_text)
         except Exception:  # noqa: BLE001
             logger.exception("异步提取长期记忆失败：%s", event.user_id)
+
+    async def _post_recall_reinforce(self, entry_ids: list[str], bot_id: str) -> None:
+        """后台回馈本轮召回命中的记忆热度（失败不影响对话，也不重试）。"""
+        try:
+            async with session_scope() as session:
+                await MemoryService(session).reinforce(entry_ids, bot_id=bot_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("异步记忆热度回馈失败：%s", bot_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # 触发 / 开关

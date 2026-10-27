@@ -96,20 +96,35 @@ def _token_weights(text: str) -> dict[str, float]:
     """token → 权重：高频单字 0.6、普通单字 1.5、二元组 1.0、关键词 1.0。
 
     疑问填充词（什么/来着/请问…）移除后再返回，查询侧不再被口语噪声稀释。
+
+    重复 token 按子线性 TF 饱和（BM25 风格）：累计出现 k 次的 token 权重
+    乘以 ``(1+ln k)/k``。单次出现权重不变（短查询完全向后兼容）；重复
+    出现仍有增益但被压缩——「火锅火锅火锅」式的长记忆不能再靠重复把
+    余弦分数线性刷高，词形分布的相对结构保留得更真实。
     """
     normalized = _normalize(text)
-    weights: dict[str, float] = {}
+    raw: dict[str, float] = {}
+    counts: dict[str, int] = {}
     for index, char in enumerate(normalized):
-        weights[char] = weights.get(char, 0.0) + (0.6 if char in _COMMON_CHARS else 1.5)
+        raw[char] = raw.get(char, 0.0) + (0.6 if char in _COMMON_CHARS else 1.5)
+        counts[char] = counts.get(char, 0) + 1
         if index + 1 < len(normalized):
             bigram = normalized[index : index + 2]
-            weights[bigram] = weights.get(bigram, 0.0) + 1.0
+            raw[bigram] = raw.get(bigram, 0.0) + 1.0
+            counts[bigram] = counts.get(bigram, 0) + 1
     for keyword in extract_keywords(text, limit=6):
         token = _normalize(keyword)
         if token:
-            weights[token] = weights.get(token, 0.0) + 1.0
+            raw[token] = raw.get(token, 0.0) + 1.0
+            counts[token] = counts.get(token, 0) + 1
     for filler in _FILLER_TOKENS:
-        weights.pop(filler, None)
+        raw.pop(filler, None)
+    weights: dict[str, float] = {}
+    for token, weight in raw.items():
+        count = counts.get(token, 1)
+        weights[token] = (
+            weight if count <= 1 else weight * (1.0 + math.log(count)) / count
+        )
     return weights
 
 

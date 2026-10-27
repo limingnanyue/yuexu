@@ -62,7 +62,27 @@ async def recover_memories(
                 existing = await session.scalar(select(MemoryEntry.id).where(
                     MemoryEntry.bot_id == library_id, MemoryEntry.source_message_id == row.id,
                 ).limit(1))
-                if (existing or not text or not row.user_id or text.startswith(("/", "／"))
+                # 历史恢复是“补旧账”，不能把用户已经否认过的同一事实重新写回来。
+                # 实时对话里允许用户改口后重建（MemoryService._find_duplicate 跳过
+                # rejected），但恢复任务必须保持原决定；因此这里额外按分区精确内容
+                # 查一次 rejected 记忆，命中则只标记日志已处理，不调用抽取。
+                rejected_conditions = [
+                    MemoryEntry.bot_id == library_id,
+                    MemoryEntry.target_type == "user",
+                    MemoryEntry.target_id == row.user_id,
+                    MemoryEntry.user_id == row.user_id,
+                    MemoryEntry.content == text,
+                    MemoryEntry.rejected.is_(True),
+                ]
+                if row.group_id:
+                    rejected_conditions.append(MemoryEntry.group_id == row.group_id)
+                else:
+                    rejected_conditions.append(MemoryEntry.group_id.is_(None))
+                rejected_existing = await session.scalar(
+                    select(MemoryEntry.id).where(*rejected_conditions).limit(1)
+                )
+                if (existing or rejected_existing or not text or not row.user_id
+                        or text.startswith(("/", "／"))
                         or NOISE_PATTERN.search(text) or row.scene == "group" and not row.group_id):
                     entries = []
                 else:

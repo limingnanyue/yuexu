@@ -7,12 +7,22 @@ import hashlib
 import math
 import re
 import time
+from bisect import bisect_left
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Sequence
 
 from backend.common.constants import MemoryMode, MemoryTier
-from backend.common.utils import extract_keywords, truncate
+from backend.common.utils import (  # noqa: F401 - keyword_coverage 显式再导出
+    KeywordQuery,
+    extract_keywords,
+    extract_query_keywords,
+    keyword_coverage,
+    keyword_idf,
+    truncate,
+)
 from backend.database.models import MemoryEntry
 
 # 表情 / 语音标记与内部指令不写入长期记忆
@@ -228,24 +238,120 @@ def tier_of(entry: MemoryEntry, hot_days: float = 7, warm_days: float = 30) -> s
     return MemoryTier.COLD.value
 
 
-def similarity(first: str, second: str) -> float:
-    """字符二元组 Jaccard + 序列相似度，适合中文短句查重 / 去重。"""
-    from difflib import SequenceMatcher
+# 文本规范化与字符二元组分片缓存。
+# 去重、MMR 重排、写入查重都会对同一批记忆反复两两比较；把「规范化文本 →
+# 二元组分片」缓存下来后，O(n²) 次比较里重复的 O(n) 次分片计算只剩一次。
+# LRU 上限避免长会话把全部记忆内容常驻内存。
+_SHINGLE_CACHE: OrderedDict[str, frozenset[str]] = OrderedDict()
+_SHINGLE_CACHE_SIZE = 4096
 
-    def shingles(text: str) -> set[str]:
-        normalized = re.sub(r"\s+", "", (text or "").lower())
-        if len(normalized) < 2:
-            return {normalized} if normalized else set()
-        return {normalized[index:index + 2] for index in range(len(normalized) - 1)}
 
-    left_text = re.sub(r"\s+", "", (first or "").lower())
-    right_text = re.sub(r"\s+", "", (second or "").lower())
-    left, right = shingles(first), shingles(second)
+def _normalize_for_similarity(text: str) -> str:
+    """相似度比较用规范化：去空白、转小写，保证同文同分。"""
+    return re.sub(r"\s+", "", (text or "").lower())
+
+
+def _shingles_of(normalized: str) -> frozenset[str]:
+    """取字符二元组（长度不足 2 时退化为单字），带 LRU 缓存。"""
+    cached = _SHINGLE_CACHE.get(normalized)
+    if cached is not None:
+        _SHINGLE_CACHE.move_to_end(normalized)
+        return cached
+    if len(normalized) < 2:
+        value = frozenset({normalized}) if normalized else frozenset()
+    else:
+        value = frozenset(
+            normalized[index:index + 2] for index in range(len(normalized) - 1)
+        )
+    _SHINGLE_CACHE[normalized] = value
+    while len(_SHINGLE_CACHE) > _SHINGLE_CACHE_SIZE:
+        _SHINGLE_CACHE.popitem(last=False)
+    return value
+
+
+def similarity(first: str, second: str, *, threshold: float = 0.0) -> float:
+    """字符二元组 Jaccard + 序列相似度，适合中文短句查重 / 去重。
+
+    ``threshold`` 用于提前剪枝，只影响性能、不改变「是否 ≥ 阈值」的判定：
+
+    - 两段文本规范化后完全相同 → 直接返回 1.0，连分片都不用做（同一个事实
+      被重复抽取、MMR 选到同一条记忆时最常命中这一支）；
+    - 二元组 Jaccard 已达阈值时，同样无需再做昂贵的序列比对——调用方比较的
+      是 ``≥ threshold``，此时结论已经确定（旧实现写成「Jaccard 偏低才剪枝」，
+      与注释相反，白白在最容易命中的分支上跑完整 SequenceMatcher）；
+    - 两段文本的长度差异给出序列相似度上界 ``2·min/(len1+len2)``，
+      上界都低于阈值时直接返回上界，跳过序列比对；
+    - 长度上界仍达标时，再做一级 O(n) 的字符多重集上界（difflib 的
+      ``quick_ratio``，同为 ``ratio()`` 的严格上界）：两段文本共同字符
+      少时它远小于长度上界，能跳过更多 O(n²) 的完整序列比对。去重扫描
+      的候选大多「长度相近但内容不同」，这一级剪枝命中率最高。
+
+    不传 ``threshold``（默认 0）时保持原语义，供 MMR 计算连续的新颖性分数。
+    """
+    left_text = _normalize_for_similarity(first)
+    right_text = _normalize_for_similarity(second)
+    left, right = _shingles_of(left_text), _shingles_of(right_text)
     if not left or not right:
         return 0.0
+    if left_text == right_text:
+        # 完全相同的文本：Jaccard 必然是 1.0，序列相似度也是 1.0
+        return 1.0
     jaccard = len(left & right) / len(left | right)
+    if threshold > 0:
+        if jaccard >= threshold:
+            # 已达阈值，结论确定：跳过 O(n²) 的 SequenceMatcher
+            return jaccard
+        matcher = SequenceMatcher(None, left_text, right_text)
+        # real_quick_ratio：O(1) 长度上界；quick_ratio：O(n) 字符多重集上界。
+        # 两者都 ≥ ratio()，因此上界 < threshold 即可断定完整计算也 < threshold。
+        upper_bound = matcher.real_quick_ratio()
+        if upper_bound < threshold:
+            return upper_bound
+        upper_bound = matcher.quick_ratio()
+        if upper_bound < threshold:
+            return max(jaccard, upper_bound)
+        sequence = matcher.ratio()
+        return max(jaccard, sequence)
     sequence = SequenceMatcher(None, left_text, right_text).ratio()
     return max(jaccard, sequence)
+
+
+# ---------------------------------------------------------------------------
+# 关键词打分
+# ---------------------------------------------------------------------------
+# 关键词覆盖率打分与 IDF 统计放在 common.utils：记忆服务与关键词向量库
+# （repositories.vector_store）共用同一套词法口径，避免两处打分不一致。
+# 这里使用模块顶部导入的 ``keyword_coverage``，同时保持对外引用兼容。
+
+
+# ---------------------------------------------------------------------------
+# 身份类事实（姓名 / 居住地 / 年龄 / 生日）
+# ---------------------------------------------------------------------------
+# 这些属性在长期对话里最容易变化（搬家、改名、过生日改年龄）。旧值若继续
+# 参与召回，会出现「新旧住址并存」并让模型把过期信息当成当前事实，因此写入
+# 新值时按属性自动作废同属性的旧记忆（见 MemoryService._supersede_identity_facts）。
+IDENTITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # 只认「我叫 X」「我的名字是 X」：不把「我是程序员」这类职业自述当成姓名，
+    # 否则用户换工作会被误判为改名并作废旧记忆。
+    ("name", re.compile(r"我叫(?P<value>[^\s，。！？,!?]{1,20})")),
+    ("name", re.compile(r"我的名字是(?P<value>[^\s，。！？,!?]{1,20})")),
+    ("city", re.compile(r"我(?:现在|目前)?(?:住在|家在|来自)(?P<value>[^\s，。！？,!?]{1,20})")),
+    ("age", re.compile(r"我(?:今年)?(?P<value>[0-9一二三四五六七八九十]{1,3})岁")),
+    ("birthday", re.compile(r"我的生日是(?P<value>[^\s，。！？,!?]{1,20})")),
+)
+
+
+def identity_fact(content: str) -> tuple[str, str] | None:
+    """识别记忆中的身份属性，返回 ``(属性名, 归一化值)``；非身份事实返回 None。"""
+    text = (content or "").strip()
+    for key, pattern in IDENTITY_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        value = re.sub(r"\s+", "", match.group("value") or "").strip("，。！？,.!? ")
+        if value:
+            return key, value
+    return None
 
 
 def vector_filter(
@@ -369,11 +475,26 @@ def filter_hits(
     degraded: bool,
     query_keywords: Sequence[str],
     rerank_weights: dict[str, Any] | None,
+    query: str = "",
     hot_days: float = 7,
     warm_days: float = 30,
     mmr_lambda: float = 0.7,
     aux_partitions: Sequence[tuple[str, str]] | None = None,
 ) -> list[RecallHit]:
+    # 词法关键度在“本次候选集”上计算 IDF：专名（火锅 / 杭州）比泛词
+    # （喜欢 / 之前）权重高。候选通常只有粗召回的几条到几十条，计算量可控。
+    # 查询剖析只构造一次：重排要给每个候选打分，旧的 ``keyword_coverage``
+    # 每次调用都会重新规范化查询、重新定位关键词，候选越多重复越多。
+    lexical_idf = (
+        keyword_idf((hit.entry.content or "" for hit in hits), query_keywords)
+        if rerank_weights is not None and query_keywords
+        else None
+    )
+    lexical_profile = (
+        KeywordQuery(query, query_keywords, idf=lexical_idf)
+        if rerank_weights is not None and query_keywords and query
+        else None
+    )
     ranked: list[RecallHit] = []
     for hit in hits:
         entry = hit.entry
@@ -401,7 +522,10 @@ def filter_hits(
             if mode == MemoryMode.PRECISE.value and not degraded:
                 continue
         hit.score = (
-            rerank_score(hit, entry, query_keywords, rerank_weights)
+            rerank_score(
+                hit, entry, query_keywords, rerank_weights,
+                query=query, idf=lexical_idf, profile=lexical_profile,
+            )
             if rerank_weights is not None
             else hit.similarity
         )
@@ -422,17 +546,25 @@ def mmr_select(
     内容相似度 ≥ ``redundancy_cap`` 的候选直接剔除（硬去重，保留原行为）。
     注入 Prompt 的记忆在同等预算内覆盖更多不同事实，减少同质化。
     ``mmr_lambda ≥ 1`` 退化为纯相关性排序（仅硬去重）。
+
+    性能：候选内容先取成列表，避免在 O(n²) 的循环里反复访问 ORM 属性；
+    每步用「上界 λ·score」做分支定界——``value ≤ λ·score`` 恒成立，上界已经
+    低于当前最优的候选不可能入选，直接跳过相似度计算。剪枝只省略不可能
+    改变结果的比较，最终选择与全量比较逐项一致。
     """
     if mmr_lambda >= 0.999:
         unique: list[RecallHit] = []
         for hit in ranked:
+            # 硬去重只需要判定「是否 ≥ 冗余上限」，传 threshold 让相似度提前剪枝
             if not any(
-                similarity(hit.entry.content, other.entry.content) >= redundancy_cap
+                similarity(hit.entry.content, other.entry.content, threshold=redundancy_cap) >= redundancy_cap
                 for other in unique
             ):
                 unique.append(hit)
         return unique
     remaining = list(ranked)
+    # 与 remaining 下标一一对应：循环中反复比较内容，避免重复访问 ORM 属性
+    contents = [(hit.entry.content or "") for hit in remaining]
     selected: list[RecallHit] = []
     selected_contents: list[str] = []
     while remaining:
@@ -440,9 +572,13 @@ def mmr_select(
         best_index = -1
         best_value = -math.inf
         for index, hit in enumerate(remaining):
+            # 分支定界：value = λ·score − (1−λ)·redundancy ≤ λ·score。
+            # 上界低于当前最优 → 本候选不可能取代最优候选，跳过相似度计算。
+            if mmr_lambda * hit.score < best_value:
+                continue
             redundancy = max(
                 (
-                    similarity(hit.entry.content, content)
+                    similarity(contents[index], content)
                     for content in selected_contents
                 ),
                 default=0.0,
@@ -455,34 +591,115 @@ def mmr_select(
                 best_index, best_value = index, value
         for index in reversed(dropped):
             remaining.pop(index)
+            contents.pop(index)
         if best_index < 0:
             break  # 剩余候选全部被去重剔除
         best_index -= sum(index < best_index for index in dropped)
         hit = remaining.pop(best_index)
+        contents.pop(best_index)
         selected.append(hit)
         selected_contents.append(hit.entry.content or "")
     return selected
 
 
 def rerank_score(
-    hit: RecallHit, entry: MemoryEntry, query_keywords: Sequence[str], weights: dict[str, Any]
+    hit: RecallHit,
+    entry: MemoryEntry,
+    query_keywords: Sequence[str],
+    weights: dict[str, Any],
+    *,
+    query: str = "",
+    idf: dict[str, float] | None = None,
+    profile: KeywordQuery | None = None,
 ) -> float:
-    similarity_weight = float(weights.get("similarity", 0.6))
-    hot_weight = float(weights.get("hot", 0.15))
-    confidence_weight = float(weights.get("confidence", 0.15))
-    keyword_weight = float(weights.get("keyword", 0.1))
+    """轻量重排：向量相似度 + 热度 + 置信度 + 词法覆盖率。
+
+    词法项不再用「命中个数 / 3」：重叠的 2/3/4 字切片会把一次长词命中
+    重复计算成满分。传入原始 ``query`` 时使用与关键词兜底完全相同的
+    IDF 加权覆盖率；旧调用（没有 query）保留按命中个数的兼容路径。
+    ``profile`` 由批量重排传入：同一查询的规范化与关键词定位只做一次。
+
+    权重在运行时归一化：后台改权重时即使没凑成 1.0，也不会让分数整体
+    漂移到 0~4 的范围，MMR 与阈值判断更稳定。
+    """
+    raw_weights = {
+        "similarity": max(0.0, float(weights.get("similarity", 0.6))),
+        "hot": max(0.0, float(weights.get("hot", 0.15))),
+        "confidence": max(0.0, float(weights.get("confidence", 0.15))),
+        "keyword": max(0.0, float(weights.get("keyword", 0.1))),
+    }
+    total_weight = sum(raw_weights.values())
+    if total_weight <= 0:
+        return max(0.0, hit.similarity)
+    weights = {key: value / total_weight for key, value in raw_weights.items()}
+
     hot = min(1.0, max(0.0, float(entry.hot_score or 0) / 10.0))
     confidence = min(1.0, max(0.0, float(entry.confidence or 0)))
-    matched = sum(1 for keyword in query_keywords if keyword in (entry.content or ""))
-    keyword_score = matched / max(1, min(3, len(query_keywords)))
+    if profile is not None:
+        keyword_score = profile.score(entry.content or "")
+    elif query and query_keywords:
+        keyword_score = keyword_coverage(
+            query, entry.content or "", query_keywords, idf=idf,
+        )
+    else:
+        matched = sum(1 for keyword in query_keywords if keyword in (entry.content or ""))
+        keyword_score = matched / max(1, min(3, len(query_keywords)))
     score = (
-        similarity_weight * hit.similarity
-        + hot_weight * hot
-        + confidence_weight * confidence
-        + keyword_weight * keyword_score
+        weights["similarity"] * hit.similarity
+        + weights["hot"] * hot
+        + weights["confidence"] * confidence
+        + weights["keyword"] * keyword_score
     )
+    # 模糊碎片只作为线索，不能压过高置信事实；惩罚保持小步，避免翻转排序。
     score -= 0.1 * float(entry.fuzzy_weight or 0)
     return max(0.0, score)
+
+
+def _best_excerpt_start(body: str, keywords: Sequence[str], size: int) -> int | None:
+    """在长笔记里挑一个「命中的查询关键词最多」的窗口起点。
+
+    注入 Prompt 时每条记忆只保留约 160 字，长对话笔记必须截取与当前问题
+    最相关的一段。旧实现在每个候选起点上都对全部关键词做一次窗口切片 +
+    ``casefold`` 判定，代价是 O(候选数 × 关键词数 × 窗口长度)；关键词多、
+    笔记长时会明显拖慢组装。
+
+    这里先用一次 ``str.find`` 扫出每个关键词的全部出现位置（允许重叠，
+    与 ``keyword in slice`` 的口径一致），再对每个候选起点用二分判断窗口
+    是否覆盖某个出现：单次判定降到 O(关键词数 × log 出现次数)。
+    找不到可用位置时返回 None，调用方退回「按超预算截断」的原行为。
+    """
+    folded = body.casefold()
+    if len(folded) != len(body):
+        # 极少数 casefold 会改变长度的字符（如德语 ß）：退回原路径，保证语义一致
+        return None
+    positions: dict[str, list[int]] = {}
+    for keyword in keywords:
+        needle = keyword.casefold()
+        if not needle:
+            continue
+        found = positions.setdefault(needle, [])
+        index = folded.find(needle)
+        while index >= 0:
+            found.append(index)
+            index = folded.find(needle, index + 1)  # 允许重叠出现
+    starts = sorted({
+        max(0, position - size // 3)
+        for found in positions.values() for position in found
+    })
+    if not starts:
+        return None
+    best_start, best_hits = starts[0], -1
+    for start in starts:
+        limit = start + size
+        hits = 0
+        for needle, found in positions.items():
+            # 起点小于窗口右边界、且结束位置越过左边界 → 该关键词落在窗口内
+            probe = bisect_left(found, limit)
+            if probe and found[probe - 1] + len(needle) > start:
+                hits += 1
+        if hits > best_hits:
+            best_start, best_hits = start, hits
+    return best_start
 
 
 def compose_prompt(
@@ -499,20 +716,20 @@ def compose_prompt(
     lines: list[str] = []
     included: list[RecallHit] = []
     used = 0
-    keywords = extract_keywords(query, limit=12)
+    # 查询关键词用于长笔记的“相关片段”定位；使用内容二字词优先的查询集合，
+    # 避免只截到笔记开头、错过与当前问题真正相关的尾部细节。
+    keywords = extract_query_keywords(query, limit=12)
     for hit in hits:
         content = re.sub(r"\s+", " ", hit.entry.content or "").strip()
         if len(content) > 160 and hit.entry.category == "conversation_summary" and keywords:
+            # 生成摘要带固定前缀（日期 + 用户归属），截取片段时必须保留，
+            # 否则模型无法判断这条笔记属于谁、什么时候。
             prefix_match = re.match(r"^\[[^\]]+\] 用户.{1,100}?与助手的对话笔记：", content)
             prefix = prefix_match.group() if prefix_match else ""
             body = content[len(prefix):]
             size = max(8, 158 - len(prefix))
-            starts = {max(0, match.start() - size // 3)
-                      for keyword in keywords for match in re.finditer(re.escape(keyword), body, re.IGNORECASE)}
-            if starts:
-                start = max(starts, key=lambda offset: sum(
-                    keyword.casefold() in body[offset:offset + size].casefold() for keyword in keywords
-                ))
+            start = _best_excerpt_start(body, keywords, size)
+            if start is not None:
                 content = prefix + ("…" if start else "") + body[start:start + size] + ("…" if start + size < len(body) else "")
         content = truncate(content, 160)
         if not content:

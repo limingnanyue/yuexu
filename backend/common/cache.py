@@ -82,31 +82,87 @@ class CacheBackend(ABC):
 
 
 class MemoryCache(CacheBackend):
-    """进程内 TTL 缓存，用于无 Redis 的本地调试场景。"""
+    """进程内 TTL 缓存，用于无 Redis 的本地调试 / 单机部署场景。
+
+    性能约束（旧实现的问题）：每次 ``get`` / ``incr`` / ``keys`` 都会遍历整张
+    ``_store`` 做过期清理，单次读取因此变成 O(条目数)。本项目的默认部署没有
+    Redis，缓存里同时挂着记忆召回结果、质量反馈标记、摘要退避标记等，条目数
+    随会话量线性增长——命中率越高，扫描次数越多，整体退化为 O(n²)。
+
+    现在改为三级惰性策略，语义保持不变：
+
+    1. **单键就地过期**：读取某个 key 时只看它自己的 deadline，命中 O(1)；
+    2. **阈值批量清理**：累计操作数或距上次清理时间超过阈值才全表扫一次，
+       把清理成本摊到批量操作上；
+    3. **容量上限**：条目数超过 ``_MAX_ENTRIES`` 时按插入顺序淘汰最旧条目，
+       避免长时间运行后内存只增不减（缓存允许丢失，丢失后会重新计算）。
+    """
 
     name = "memory"
 
-    def __init__(self, prefix: str = "") -> None:
+    # 批量清理阈值：累计 256 次操作或 1 秒后触发一次全表过期清理。
+    _PURGE_OPERATIONS = 256
+    _PURGE_INTERVAL_SECONDS = 1.0
+    # 条目上限：缓存允许丢失，超过上限后淘汰最旧条目。
+    _MAX_ENTRIES = 20000
+
+    def __init__(self, prefix: str = "", *, max_entries: int = 20000) -> None:
         super().__init__(prefix)
         self._store: dict[str, tuple[str, float | None]] = {}
+        self._max_entries = max(1, int(max_entries))
+        self._operations = 0
+        self._last_purge = time.time()
 
-    def _purge(self) -> None:
+    def _live(self, full_key: str) -> tuple[str, float | None] | None:
+        """读取单个键并就地处理过期（O(1)，不触发全表扫描）。"""
+        item = self._store.get(full_key)
+        if item is None:
+            return None
+        value, deadline = item
+        if deadline is not None and deadline <= time.time():
+            self._store.pop(full_key, None)
+            return None
+        return value, deadline
+
+    def _trim(self, current: float) -> None:
+        """条目超上限时按插入顺序淘汰最旧条目（dict 保序，均摊 O(1)）。"""
+        overflow = len(self._store) - self._max_entries
+        if overflow <= 0:
+            return
+        for key in list(self._store.keys())[:overflow]:
+            self._store.pop(key, None)
+
+    def _purge(self, *, force: bool = False) -> None:
+        """按阈值惰性清理过期条目（``force`` 供 ``keys`` 等全量操作用）。"""
+        self._operations += 1
         current = time.time()
+        if (
+            not force
+            and self._operations < self._PURGE_OPERATIONS
+            and current - self._last_purge < self._PURGE_INTERVAL_SECONDS
+        ):
+            return
+        self._operations = 0
+        self._last_purge = current
         expired = [
             key for key, (_, deadline) in self._store.items()
             if deadline is not None and deadline <= current
         ]
         for key in expired:
             self._store.pop(key, None)
+        self._trim(current)
 
     async def get(self, key: str) -> str | None:
         self._purge()
-        item = self._store.get(self._key(key))
+        item = self._live(self._key(key))
         return item[0] if item else None
 
     async def set(self, key: str, value: str, ttl: int | None = None) -> None:
+        self._purge()
         deadline = time.time() + ttl if ttl and ttl > 0 else None
         self._store[self._key(key)] = (value, deadline)
+        if len(self._store) > self._max_entries:
+            self._trim(time.time())
 
     async def delete(self, *keys: str) -> None:
         for key in keys:
@@ -118,15 +174,20 @@ class MemoryCache(CacheBackend):
     async def incr(self, key: str, ttl: int | None = None) -> int:
         self._purge()
         full_key = self._key(key)
-        raw, deadline = self._store.get(full_key, (None, None))
+        item = self._live(full_key)
+        raw, deadline = item or (None, None)
         value = int(raw or 0) + 1
+        # 与 Redis Lua 脚本一致：只在计数器首次创建时设置过期时间。
         if deadline is None and ttl and ttl > 0:
             deadline = time.time() + ttl
         self._store[full_key] = (str(value), deadline)
+        if len(self._store) > self._max_entries:
+            self._trim(time.time())
         return value
 
     async def keys(self, pattern: str = "*") -> list[str]:
-        self._purge()
+        # keys 本身就要遍历全表，这里顺便强制清理一次，返回值不含过期条目。
+        self._purge(force=True)
         full_pattern = self._key(pattern)
         return [
             key[len(self.prefix):] for key in self._store
@@ -134,7 +195,7 @@ class MemoryCache(CacheBackend):
         ]
 
     async def ttl(self, key: str) -> int:
-        item = self._store.get(self._key(key))
+        item = self._live(self._key(key))
         if not item or item[1] is None:
             return -1
         return max(int(item[1] - time.time()), 0)

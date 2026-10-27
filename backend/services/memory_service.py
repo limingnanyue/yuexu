@@ -23,7 +23,14 @@ from backend.common.cache import CacheBackend
 from backend.common.constants import MemoryMode
 from backend.common.exceptions import ConflictError, NotFoundError, ValidationError
 from backend.common.logger import get_logger
-from backend.common.utils import clean_text, extract_keywords, truncate
+from backend.common.utils import (
+    KeywordQuery,
+    clean_text,
+    extract_keywords,
+    extract_query_keywords,
+    keyword_idf,
+    truncate,
+)
 from backend.core.config_loader import get_config
 from backend.core.runtime import get_cache
 from backend.database.models import BotAccount, MemoryEntry
@@ -55,6 +62,7 @@ from backend.services.memory_support import (
     filter_hits,
     get_breaker,
     get_semaphore,
+    identity_fact,
     is_overview_query,
     metadata_from_entry,
     release_inflight,
@@ -65,6 +73,13 @@ from backend.services.memory_support import (
 )
 
 logger = get_logger("yuexu.service.memory")
+
+# 指代 / 指示词：查询里有这些词时，即使超过 16 字也需要用最近上文补实体。
+# ``(?<!其)他`` 排除“其他”这类非人称用法。
+_PRONOUN_QUERY = re.compile(
+    r"(?:它|她|(?<!其)他|这个|那个|这只|那只|这位|那位|这件|那件|"
+    r"这事|那事|对方|此人|上面|前面|刚才|之前说的|刚说的)"
+)
 
 __all__ = ["MemoryService", "RecallHit", "RecallResult"]
 
@@ -153,10 +168,21 @@ class MemoryService:
         return MemoryMode.PRECISE.value
 
     async def _llm_fuzzy_confirm(self, text: str) -> bool:
+        """LLM 二次确认是否模糊回忆类查询（``memory.fuzzy_llm_confirm`` 开启时）。
+
+        该调用位于召回主链路之前、且不受召回超时（wait_for）约束，超时
+        会直接叠加到回复延迟上，因此默认上限从固定 2s 收紧为可配置的
+        ``memory.fuzzy_llm_confirm_timeout_ms``（默认 800ms，与模糊召回的
+        时间预算同量级）；判定失败的后果只是少一次模式修正，宁快勿准。
+        """
         try:
             from backend.services.llm_service import LLMService
 
             llm = LLMService(self.session)
+            timeout = max(
+                0.3,
+                self._number("memory.fuzzy_llm_confirm_timeout_ms", 800) / 1000,
+            )
             reply = await asyncio.wait_for(
                 llm.chat(
                     [
@@ -169,7 +195,7 @@ class MemoryService:
                     max_tokens=8,
                     temperature=0.0,
                 ),
-                timeout=2.0,
+                timeout=timeout,
             )
             return reply.success and ("是" in reply.content[:10] or "yes" in reply.content.lower())
         except Exception:  # noqa: BLE001
@@ -177,22 +203,39 @@ class MemoryService:
 
     @staticmethod
     def _expand_query(query: str, context_texts: Sequence[str] | None) -> str:
-        """指代消解：短查询（信息量不足，常见代词/疑问句式）拼接最近上文关键词。
+        """指代消解：把最近上文的实体拼进检索查询，解决「它 / 这个」无词可查。
 
-        只扩展检索用查询（缓存 key、向量/关键词检索），模式判定仍看原句；
-        长查询通常自含主题，不扩展避免稀释。
+        只扩展检索用查询（缓存 key、向量/关键词检索），模式判定仍看原句。
+        触发条件从「短查询」放宽到「短查询或含指代词的中等长度查询」：像
+        「你还记得我之前说的那只猫叫什么名字吗」信息不足但长度超过 16 字，
+        旧逻辑会直接放弃扩展。过长且没有指代词的查询仍按自含主题处理，避免
+        把无关上下文塞进检索、稀释关键词。
+
+        上下文取最近两条，并优先使用内容二字词（IDF 覆盖率口径），最多补 4
+        个实体词；只增加召回依据，不改变用户原话和模型最终回复。
         """
-        if not context_texts or len(query) > 16:
+        if not context_texts:
             return query
-        query_tokens = set(extract_keywords(query, limit=10))
+        stripped = (query or "").strip()
+        if not stripped:
+            return query
+        if len(stripped) > 32:
+            return query
+        if len(stripped) > 16 and not _PRONOUN_QUERY.search(stripped):
+            return query
+        query_tokens = set(extract_query_keywords(stripped, limit=12))
         extra: list[str] = []
         for text in list(context_texts)[-2:]:
-            for keyword in extract_keywords(text, limit=4):
+            for keyword in extract_query_keywords(text, limit=6):
                 if keyword not in query_tokens and keyword not in extra:
                     extra.append(keyword)
+                if len(extra) >= 4:
+                    break
+            if len(extra) >= 4:
+                break
         if not extra:
             return query
-        return f"{query} {' '.join(extra[:6])}"
+        return f"{stripped} {' '.join(extra[:4])}"
 
     # ------------------------------------------------------------------
     # 召回主流程
@@ -391,41 +434,48 @@ class MemoryService:
             )
 
         # 辅助分区（群共享 / 全局）合并检索：best-effort，失败只少记不报错；
-        # 熔断打开时不触碰向量库，整体限制在剩余预算内，不拖慢主链路
+        # 熔断打开时不触碰向量库，整体限制在剩余预算内，不拖慢主链路。
+        # 多个辅助分区并行检索（各自带独立超时），总耗时从分区数累加
+        # 压到最慢一个分区，群聊 + 全局双分区时延迟近似减半。
         if aux_filters:
-            async def _aux_all() -> list[RecallHit]:
-                merged: list[RecallHit] = []
-                for aux_filter in aux_filters:
-                    if vector_available:
-                        hits = await self._aux_hits(
-                            search_query, aux_filter, coarse_limit, overview=overview,
-                        )
-                    else:
-                        hits = await self._safe_keyword_hits(
-                            search_query, aux_filter, coarse_limit, "",
-                            overview=overview, timeout=0.1,
-                        )
-                    merged = self._merge_hits(merged, hits)
-                return merged
+            async def _aux_one(aux_filter: dict[str, Any]) -> list[RecallHit]:
+                if vector_available:
+                    return await self._aux_hits(
+                        search_query, aux_filter, coarse_limit, overview=overview,
+                    )
+                return await self._safe_keyword_hits(
+                    search_query, aux_filter, coarse_limit, "",
+                    overview=overview, timeout=0.1,
+                )
 
             try:
-                raw_hits = self._merge_hits(raw_hits, await asyncio.wait_for(
-                    _aux_all(), timeout=0.3,
-                ))
+                aux_merged: list[RecallHit] = []
+                for hits in await asyncio.wait_for(
+                    asyncio.gather(*(_aux_one(item) for item in aux_filters)),
+                    timeout=0.3,
+                ):
+                    aux_merged = self._merge_hits(aux_merged, hits)
+                raw_hits = self._merge_hits(raw_hits, aux_merged)
             except asyncio.TimeoutError:
                 logger.debug("辅助分区检索超时，跳过群共享 / 全局记忆")
 
-        # 模糊模式双路召回：向量 + 关键词
+        # 模糊模式双路召回：向量 + 关键词。主分区与辅助分区的关键词路
+        # 并行执行（各自带独立超时），模糊模式整体仍受 recall 超时约束。
         if mode == MemoryMode.FUZZY.value and self.vector.name != "keyword" and not overview:
-            extra = await self._safe_keyword_hits(
-                search_query, filters, coarse_limit, scope_type,
-                overview=overview, timeout=0.25,
-            )
-            raw_hits = self._merge_hits(raw_hits, extra)
-            for aux_filter in aux_filters:
-                raw_hits = self._merge_hits(raw_hits, await self._safe_keyword_hits(
+            keyword_tasks = [
+                self._safe_keyword_hits(
+                    search_query, filters, coarse_limit, scope_type,
+                    overview=overview, timeout=0.25,
+                )
+            ]
+            keyword_tasks.extend(
+                self._safe_keyword_hits(
                     search_query, aux_filter, coarse_limit, "", timeout=0.25,
-                ))
+                )
+                for aux_filter in aux_filters
+            )
+            for hits in await asyncio.gather(*keyword_tasks):
+                raw_hits = self._merge_hits(raw_hits, hits)
 
         threshold = self._number(
             "memory.fuzzy_threshold"
@@ -455,8 +505,11 @@ class MemoryService:
             threshold=threshold,
             max_fuzzy_weight=self._number("memory.precise_max_fuzzy_weight", 0.5),
             degraded=degraded,
-            query_keywords=extract_keywords(search_query, limit=8),
+            # 查询关键词使用内容二字词优先的集合：长问句尾部的实体也能进入
+            # 重排，而不是被句首的“你还记得 / 我之前”占满 8 个名额。
+            query_keywords=extract_query_keywords(search_query, limit=12),
             rerank_weights=weights,
+            query=search_query,
             hot_days=self._number("memory.hot_days", 7),
             warm_days=self._number("memory.warm_days", 30),
             mmr_lambda=self._number("memory.mmr_lambda", 0.7),
@@ -557,7 +610,9 @@ class MemoryService:
         # overview 由调用方按原始查询预判定（扩展后的查询会破坏整句匹配）
         if overview is None:
             overview = is_overview_query(query)
-        keywords = [] if overview else extract_keywords(query, limit=8)
+        # 内容二字词优先 + 长短语补充：长问句句尾的专名也能进入 SQL LIKE
+        # 候选圈选，避免旧实现只取句首 8 个 n-gram 导致“后面问的查不到”。
+        keywords = [] if overview else extract_query_keywords(query, limit=12)
         if not keywords and not overview:
             return []
         rows = await self.repo.search_candidates(
@@ -570,18 +625,32 @@ class MemoryService:
             scope_type=scope_type,
             limit=max(limit * 3, 12),
         )
+        if not rows:
+            return []
+        if overview:
+            # 整体回顾（「你还记得我吗」）：分区内近期记忆都算相关线索，
+            # 由统一重排按热度 / 置信度决定最终注入顺序。
+            return [RecallHit(entry=row, similarity=1.0, source="keyword") for row in rows]
+        # 关键词打分：IDF 加权覆盖率（稀有词命中权重更高，避免 2 字泛词刷分）。
+        # IDF 在本次候选集上统计——候选由 SQL LIKE 圈出，已能代表本分区的词分布。
+        # 查询剖析在这里构造一次，循环内只做「关键词是否出现」的判定。
+        idf = self._keyword_idf(rows, keywords)
+        profile = KeywordQuery(query, keywords, idf=idf)
         hits: list[RecallHit] = []
         for row in rows:
-            matched = 1 if overview else sum(1 for keyword in keywords if keyword in (row.content or ""))
-            if matched:
-                hits.append(
-                    RecallHit(
-                        entry=row,
-                        similarity=1.0 if overview else min(1.0, matched / min(3, len(keywords))),
-                        source="keyword",
-                    )
-                )
+            score = profile.score(row.content or "")
+            if score > 0:
+                hits.append(RecallHit(entry=row, similarity=score, source="keyword"))
+        # 按词法强度排序：合并进固定长度候选列表时优先保留强匹配
+        hits.sort(key=lambda item: item.similarity, reverse=True)
         return hits
+
+    @staticmethod
+    def _keyword_idf(
+        rows: Sequence[MemoryEntry], keywords: Sequence[str]
+    ) -> dict[str, float]:
+        """候选集上的平滑 IDF：``log((N+1)/(df+1)) + 1``，稀有词权重更高。"""
+        return keyword_idf((row.content or "" for row in rows), keywords)
 
     async def _safe_keyword_hits(
         self,
@@ -685,7 +754,17 @@ class MemoryService:
         source_message_id: str | None = None,
         check_duplicate: bool = True,
         library_id: str | None = None,
+        index_vector: bool = True,
+        duplicate_pool: list[MemoryEntry] | None = None,
     ) -> MemoryEntry | None:
+        """写入一条记忆；重复 / 无效内容返回 None。
+
+        ``index_vector=False`` 由批量写入方（``extract_and_store``）使用：一次
+        抽取往往产生多条事实，逐条写向量意味着逐条做一次嵌入（onnx / api
+        provider 每条都是一次模型请求），批量方会在最后统一 ``index_entries``。
+        ``duplicate_pool`` 同样是批量方传入的近邻查重快照，省掉每条事实一次
+        「最近 40 条」查询；单条写入不传任何参数时行为与旧实现完全一致。
+        """
         generated_summary = category == "conversation_summary" and str(source_message_id or "").startswith("ctxsum_")
         limit = 1200 if generated_summary else int(self.config.get("memory.max_entry_chars", 500))
         text = clean_text(content, limit)
@@ -708,17 +787,24 @@ class MemoryService:
             ).limit(1))
             if existing is not None:
                 return None
-        if check_duplicate and not generated_summary and await self._is_duplicate(
-            bot_id=bot_id,
-            target_type=target_type,
-            target_id=target_id,
-            user_id=user_id,
-            group_id=group_id,
-            content=text,
-            category=category,
-        ):
-            logger.debug("记忆重复，跳过写入：%s", truncate(text, 30))
-            return None
+        if check_duplicate and not generated_summary:
+            duplicate = await self._find_duplicate(
+                bot_id=bot_id,
+                target_type=target_type,
+                target_id=target_id,
+                user_id=user_id,
+                group_id=group_id,
+                content=text,
+                category=category,
+                recent_pool=duplicate_pool,
+            )
+            if duplicate is not None:
+                # 重复出现本身是“这条事实仍然有效”的证据：不新增行，但小幅
+                # 提升原记忆的置信度 / 热度，让反复提到的偏好与身份事实在
+                # 后续召回中更靠前。写操作按条目限频，避免刷屏式写放大。
+                await self._touch_duplicate(duplicate)
+                logger.debug("记忆重复，已回馈原条目：%s", truncate(text, 30))
+                return None
 
         entry = await self.repo.create(
             bot_id=bot_id,
@@ -742,14 +828,90 @@ class MemoryService:
             rejected=rejected,
             source_message_id=source_message_id,
         )
-        try:
-            await self.vector.add([entry.id], [text], [metadata_from_entry(entry)])
-        except Exception as exc:  # noqa: BLE001 - 向量失败不影响数据库记忆
-            logger.warning("向量索引写入失败（已保留数据库记忆）：%s", exc)
+        if index_vector:
+            await self.index_entries([entry])
+        # 身份事实自动更正：新值落库成功后再作废同属性的旧值，避免创建失败时
+        # 旧记忆已经被清掉（先写后删，任何一步失败都还有一份可用记忆）。
+        if not generated_summary and self.config.get("memory.supersede_enabled", True):
+            await self._supersede_identity_facts(entry)
         await self._bump_recall_cache(entry.bot_id, entry.target_type, entry.target_id)
         return entry
 
-    async def _is_duplicate(
+    async def index_entries(self, entries: Sequence[MemoryEntry]) -> int:
+        """批量写向量索引：一次嵌入调用代替「每条记忆一次调用」。
+
+        长消息一次可抽取 8 条事实，群聊还会同步写入群共享分区；旧实现每条
+        事实各调一次 ``vector.add``（内置稀疏嵌入是纯 CPU，onnx / api 嵌入
+        则每条都是一次模型请求，8 条事实因此多等 8 次往返、也更容易撞上
+        服务商限流）。这里合并为一次批量写入，返回成功写入的条数。
+        向量失败仍然只记日志——数据库记忆才是事实来源。
+        """
+        items = [entry for entry in entries if entry is not None]
+        if not items:
+            return 0
+        try:
+            await self.vector.add(
+                [entry.id for entry in items],
+                [entry.content or "" for entry in items],
+                [metadata_from_entry(entry) for entry in items],
+            )
+            return len(items)
+        except Exception as exc:  # noqa: BLE001 - 向量失败不影响数据库记忆
+            logger.warning("向量索引批量写入失败（已保留数据库记忆）：%s", exc)
+            return 0
+
+    async def _supersede_identity_facts(self, entry: MemoryEntry) -> list[MemoryEntry]:
+        """身份事实自动更正：同属性只保留最新值（搬家 / 改名 / 年龄变化）。
+
+        只处理姓名、居住地、年龄、生日四类确定性属性，且要求新旧值不同；
+        偏好、经历、计划等可以并存的记忆不受影响，避免误删。
+        旧记忆标记 ``rejected``（不再参与召回，后台仍可查看），并同步向量元数据。
+        """
+        if entry.category in {"conversation_summary", "emotion", "experience"}:
+            return []
+        fact = identity_fact(entry.content)
+        if fact is None:
+            return []
+        key, value = fact
+        # 用属性模式圈选全部历史身份候选，而不是只看最近 60 条：用户聊了
+        # 几十轮日常后再搬家，旧住址仍应被新值作废。
+        candidates = await self.repo.identity_candidates(
+            entry.bot_id,
+            target_type=entry.target_type,
+            target_id=entry.target_id,
+            user_id=entry.user_id,
+            group_id=entry.group_id,
+        )
+        stale: list[MemoryEntry] = []
+        for other in candidates:
+            if other.id == entry.id or other.rejected:
+                continue
+            other_fact = identity_fact(other.content)
+            if other_fact is None or other_fact[0] != key or other_fact[1] == value:
+                continue
+            stale.append(other)
+        if not stale:
+            return []
+        for other in stale:
+            other.rejected = True
+            other.confidence = max(0.0, float(other.confidence or 0) - 0.2)
+            other.hot_score = 0.0
+        # 旧值作废后立即刷写，保证下一次召回（可能来自并发会话）看到的是新状态
+        await self.session.flush()
+        try:
+            await self.vector.update_metadata(
+                [other.id for other in stale], {"rejected": True}
+            )
+        except Exception:  # noqa: BLE001 - 向量元数据失败可由重建索引修复
+            logger.debug("同步身份旧记忆向量元数据失败", exc_info=True)
+        await self._bump_entries_scope(stale)
+        logger.info(
+            "身份事实更正（%s）：作废旧记忆 %s 条，新值=%s",
+            key, len(stale), truncate(value, 20),
+        )
+        return stale
+
+    async def _find_duplicate(
         self,
         *,
         bot_id: str,
@@ -759,7 +921,17 @@ class MemoryService:
         group_id: str | None,
         content: str,
         category: str = "fact",
-    ) -> bool:
+        recent_pool: list[MemoryEntry] | None = None,
+    ) -> MemoryEntry | None:
+        """查找已有重复记忆，返回原条目而不是布尔值（用于重复证据回馈）。
+
+        顺序：精确文本 → 向量相似度 → 最近 40 条字符相似度。任一步命中即
+        返回；被用户否认（rejected）的旧条目不算重复，允许用户重新建立记忆。
+
+        ``recent_pool`` 由批量写入方复用：一次抽取的多条事实属于同一个分区，
+        近邻快照只需取一次（旧实现每条事实都查一次「最近 40 条」）。批量方
+        会把本批新增的条目追加进快照，因此同批事实之间仍然互相查重。
+        """
         exact = await self.repo.find_exact(
             bot_id,
             target_type=target_type,
@@ -768,8 +940,8 @@ class MemoryService:
             group_id=group_id,
             content=content,
         )
-        if exact is not None:
-            return True
+        if exact is not None and not exact.rejected:
+            return exact
         dated = re.match(r"^记录日期 (\d{4}-\d{2}-\d{2})[：:]", content)
         record_date = dated.group(1) if dated and category in {"emotion", "experience"} else None
         threshold = self._number("memory.dedupe_threshold", 0.9)
@@ -783,30 +955,52 @@ class MemoryService:
             )
             if pairs and pairs[0][1] >= threshold:
                 if record_date is None:
-                    return True
-                for entry_id, score in pairs:
-                    if score < threshold:
-                        continue
-                    entry = await self.repo.get(entry_id)
-                    if entry and entry.category in {"emotion", "experience"} and re.match(
-                        rf"^记录日期 {record_date}[：:]", entry.content,
+                    candidate = await self.repo.get(pairs[0][0])
+                    # 向量分数经 ×7 校准后接近饱和（弱重叠也能到 1.0），必须再用
+                    # 原文相似度确认；否则「相关但不同」的新事实会被当成重复丢掉。
+                    if (
+                        candidate is not None
+                        and not candidate.rejected
+                        and similarity(content, candidate.content or "", threshold=threshold) >= threshold
                     ):
-                        return True
-        except Exception:  # noqa: BLE001
-            pass
-        recent = await self.repo.recent_for_target(
-            bot_id,
-            target_type=target_type,
-            target_id=target_id,
-            user_id=user_id,
-            group_id=group_id,
-            limit=40,
-        )
+                        return candidate
+                else:
+                    for entry_id, score in pairs:
+                        if score < threshold:
+                            continue
+                        entry = await self.repo.get(entry_id)
+                        if (
+                            entry
+                            and not entry.rejected
+                            and entry.category in {"emotion", "experience"}
+                            and re.match(rf"^记录日期 {record_date}[：:]", entry.content)
+                            and similarity(content, entry.content or "", threshold=threshold) >= threshold
+                        ):
+                            return entry
+        except Exception:  # noqa: BLE001 - 向量检索失败时仍走近邻字符查重
+            logger.debug("向量查重失败，回退近邻字符相似度", exc_info=True)
+        if recent_pool is None:
+            recent: Sequence[MemoryEntry] = await self.repo.recent_for_target(
+                bot_id,
+                target_type=target_type,
+                target_id=target_id,
+                user_id=user_id,
+                group_id=group_id,
+                limit=40,
+            )
+        else:
+            recent = recent_pool
+        if not recent:
+            return None
         # 40 条近邻的 O(n) 字符相似度扫描（SequenceMatcher）放入工作线程，
         # 写入路径不阻塞事件循环
         return await asyncio.to_thread(
             self._scan_recent_duplicates, content, record_date, recent, threshold
         )
+
+    async def _is_duplicate(self, **kwargs: Any) -> bool:
+        """兼容旧内部调用：只关心是否存在重复。"""
+        return await self._find_duplicate(**kwargs) is not None
 
     @staticmethod
     def _scan_recent_duplicates(
@@ -814,7 +1008,7 @@ class MemoryService:
         record_date: str | None,
         recent: Sequence[MemoryEntry],
         threshold: float,
-    ) -> bool:
+    ) -> MemoryEntry | None:
         date_prefix = (
             re.compile(rf"^记录日期 {record_date}[：:]") if record_date else None
         )
@@ -824,9 +1018,48 @@ class MemoryService:
                 and date_prefix.match(entry.content or "")
             ):
                 continue
-            if similarity(content, entry.content or "") >= threshold:
-                return True
-        return False
+            if similarity(content, entry.content or "", threshold=threshold) >= threshold:
+                return entry
+        return None
+
+    async def _touch_duplicate(self, entry: MemoryEntry) -> bool:
+        """重复提及回馈：原条目小幅升置信 / 升热，按条目限频写库。
+
+        与 ``reinforce``（召回成功后的热度回馈）区分：这里代表“用户又说了一遍
+        同一事实”，不增加 hit_count，也不改变模糊权重。默认 24 小时最多一次，
+        既保留重复证据，又避免每轮闲聊都写数据库。
+        """
+        if entry.rejected or not self.config.get("memory.duplicate_reinforce", True):
+            return False
+        interval = int(self._number("memory.duplicate_reinforce_interval", 86400))
+        marker = f"memdup:{entry.id}"
+        if interval > 0:
+            try:
+                if await self.cache.get(marker):
+                    return False
+            except Exception:  # noqa: BLE001 - 缓存故障不阻断写入
+                logger.debug("读取重复记忆回馈标记失败", exc_info=True)
+        confidence_boost = max(0.0, self._number("memory.duplicate_confidence_boost", 0.03))
+        hot_boost = max(0.0, self._number("memory.duplicate_hot_boost", 0.1))
+        old_confidence = float(entry.confidence or 0)
+        old_hot = float(entry.hot_score or 0)
+        entry.confidence = min(1.0, old_confidence + confidence_boost)
+        entry.hot_score = min(10.0, old_hot + hot_boost)
+        if entry.confidence == old_confidence and entry.hot_score == old_hot:
+            return False
+        await self.session.flush()
+        if interval > 0:
+            try:
+                await self.cache.set(marker, "1", ttl=interval)
+            except Exception:  # noqa: BLE001
+                logger.debug("写入重复记忆回馈标记失败", exc_info=True)
+        # 置信度 / 热度参与重排，必须让本分区召回缓存失效。
+        await self._bump_entries_scope([entry])
+        logger.debug(
+            "重复记忆回馈：%s（confidence %.2f→%.2f, hot %.2f→%.2f）",
+            entry.id, old_confidence, entry.confidence, old_hot, entry.hot_score,
+        )
+        return True
 
     async def extract_and_store(
         self,
@@ -856,6 +1089,8 @@ class MemoryService:
                 timeout=self._number("memory.extract_timeout", 8),
                 record_date=record_date,
                 strict_extraction=strict_extraction,
+                # 长消息多段并发抽取；默认 2 路，避免把服务商限流打满。
+                llm_concurrency=int(self.config.get("memory.extract_concurrency", 2)),
             )
         )
         stored: list[MemoryEntry] = []
@@ -864,7 +1099,40 @@ class MemoryService:
             and bool(event.group_id)
             and bool(self.config.get("memory.group_shared_extract", True))
         )
+        # 一次抽取会产出多条事实（群聊还会同步写入群共享分区）。旧实现每条
+        # 事实都要：查一次向量嵌入 + 查一次「最近 40 条」做字符查重，8 条事实
+        # 就是 8 次嵌入调用（onnx / api provider 每次都是一次模型请求）与 8 次
+        # 查询。这里按分区各取一次近邻快照复用，并把向量索引推迟到循环结束后
+        # 一次性批量写入；本批新增的条目会追加进快照，同批事实之间仍然互相
+        # 查重（语义与逐条查询一致）。
+        pools: dict[tuple[str, str, str | None], list[MemoryEntry]] = {}
+        bot_id = await self.resolve_bot_id(event.bot_id)
+
+        async def pool_for(
+            target_type: str, target_id: str, group_id: str | None
+        ) -> list[MemoryEntry]:
+            key = (target_type, target_id, group_id)
+            pool = pools.get(key)
+            if pool is None:
+                pool = list(await self.repo.recent_for_target(
+                    bot_id,
+                    target_type=target_type,
+                    target_id=target_id,
+                    user_id=event.user_id,
+                    group_id=group_id,
+                    limit=40,
+                ))
+                pools[key] = pool
+            return pool
+
+        def remember(pool: list[MemoryEntry], entry: MemoryEntry) -> None:
+            """把本批新条目并入快照，并保持快照规模与「最近 40 条」一致。"""
+            pool.append(entry)
+            if len(pool) > 40:
+                del pool[: len(pool) - 40]
+
         for fact in facts:
+            user_pool = await pool_for("user", str(event.user_id), event.group_id)
             entry = await self.add_memory(
                 bot_id=event.bot_id,
                 target_type="user",
@@ -880,11 +1148,15 @@ class MemoryService:
                 fuzzy_weight=float(fact.get("fuzzy_weight") or 0.1),
                 keywords=fact.get("keywords") or None,
                 source_message_id=event.message_id,
+                index_vector=False,
+                duplicate_pool=user_pool,
             )
             if entry is not None:
                 stored.append(entry)
+                remember(user_pool, entry)
             # 群聊事实同步写入群共享分区：群内所有成员的对话都可召回
             if group_shared:
+                shared_pool = await pool_for("group", str(event.group_id), str(event.group_id))
                 shared = await self.add_memory(
                     bot_id=event.bot_id,
                     target_type="group",
@@ -900,10 +1172,15 @@ class MemoryService:
                     fuzzy_weight=float(fact.get("fuzzy_weight") or 0.1),
                     keywords=fact.get("keywords") or None,
                     source_message_id=event.message_id,
+                    index_vector=False,
+                    duplicate_pool=shared_pool,
                 )
                 if shared is not None:
                     stored.append(shared)
+                    remember(shared_pool, shared)
         if stored:
+            # 批量写索引：一次嵌入调用覆盖本轮全部新记忆，失败不影响数据库记忆
+            await self.index_entries(stored)
             logger.info("写入长期记忆 %s 条：%s", len(stored), event.user_id)
         return stored
 
@@ -959,7 +1236,11 @@ class MemoryService:
             scope_type=event.scene.value,
             limit=100,
         )
-        matched = [row for row in rows if keyword in (row.content or "")] or rows
+        # 原文不含该关键字时不能退回“整批否认”：LIKE 兜底会把任何二字词命中的
+        # 记忆都圈进来，一次 /forget 就会误伤几十条无关记忆。
+        matched = [row for row in rows if keyword in (row.content or "")]
+        if not matched:
+            return 0
         return await self.reject([row.id for row in matched])
 
     # ------------------------------------------------------------------
@@ -1017,6 +1298,55 @@ class MemoryService:
         }
         for bot_id, target_type, target_id in scopes:
             await self._bump_recall_cache(bot_id, target_type, target_id)
+
+    async def reinforce(
+        self,
+        entry_ids: Sequence[str],
+        *,
+        bot_id: str | None = None,
+        boost: float | None = None,
+        min_interval: float | None = None,
+    ) -> int:
+        """召回命中回馈：热度 / 命中次数 / 最近命中时间。
+
+        与用户主动「确认」不同，这里只做很小的热度增量（默认 +0.2）并按条目
+        限频（默认 6 小时一次）：反复被想起的记忆自然升为热记忆、排序更靠前，
+        同时避免每轮对话都写库造成写放大。调用方应在回复发送后异步执行，
+        不占用用户等待链路。
+        """
+        ids = [item for item in dict.fromkeys(entry_ids) if item]
+        if not ids:
+            return 0
+        entries = await self.repo.get_many(ids)
+        if bot_id is not None:
+            library_id = await self.resolve_bot_id(bot_id)
+            entries = [entry for entry in entries if entry.bot_id == library_id]
+        boost = (
+            self._number("memory.recall_reinforce_boost", 0.2)
+            if boost is None else float(boost)
+        )
+        interval = (
+            self._number("memory.recall_reinforce_interval", 21600)
+            if min_interval is None else float(min_interval)
+        )
+        now = datetime.now()
+        changed: list[MemoryEntry] = []
+        for entry in entries:
+            if entry.rejected:
+                continue
+            last = entry.last_hit_at
+            if last is not None and (now - last).total_seconds() < interval:
+                continue  # 限频：同一记忆短期内只记一次命中，避免写放大
+            entry.hot_score = min(10.0, float(entry.hot_score or 0) + boost)
+            entry.hit_count = int(entry.hit_count or 0) + 1
+            entry.last_hit_at = now
+            changed.append(entry)
+        if not changed:
+            return 0
+        await self.session.flush()
+        # 热度参与重排权重，分区缓存需要失效，下一次召回才会用上新分数
+        await self._bump_entries_scope(changed)
+        return len(changed)
 
     @staticmethod
     def detect_feedback(text: str) -> str | None:
@@ -1194,9 +1524,14 @@ class MemoryService:
     # 维护任务（实现见 memory_maintenance）
     # ------------------------------------------------------------------
     async def decay_all(self) -> int:
-        return await maintenance_decay(
+        count = await maintenance_decay(
             self.repo, self._number("memory.hot_decay", 0.92)
         )
+        if count:
+            # 热度参与重排分数；衰减后若继续命中旧召回缓存，排序会停留在
+            # 衰减前，直到 TTL 过期。全局代际号一次失效所有分区缓存即可。
+            await self._invalidate_recall_cache()
+        return count
 
     async def dedupe_all(self, limit: int | None = None) -> int:
         batch = int(limit or self.config.get("memory.maintenance_batch", 500))

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.common.logger import get_logger
-from backend.common.utils import extract_keywords
+from backend.common.utils import KeywordQuery, extract_query_keywords, keyword_idf
 from backend.repositories.embedding_provider import (
     EMBEDDING_SIGNATURE_KEY,
     EmbeddingProvider,
@@ -228,7 +229,11 @@ class KeywordVectorStore(VectorStore):
         bot_id = str(where.get("bot_id") or "")
         if not bot_id or not query:
             return []
-        keywords = extract_keywords(query, limit=8)
+        # 词法口径与 MemoryService 的关键词兜底 / 模糊双路召回保持一致：
+        # 内容二字词优先（extract_query_keywords），长句尾部的专名也能进入
+        # SQL LIKE 候选圈选。旧实现用「少量代表性标签」（extract_keywords
+        # limit=8），与主链路的打分口径不一致，降级时召回质量会额外缩水。
+        keywords = extract_query_keywords(query, limit=12)
         if not keywords:
             return []
         rows = await self._repo.search_candidates(
@@ -242,12 +247,17 @@ class KeywordVectorStore(VectorStore):
             limit=limit * 4,
         )
         scored: list[tuple[str, float]] = []
+        # 与 MemoryService 的模糊 / 兜底召回共用同一套关键词打分：
+        # 字符并集覆盖率 + 候选集 IDF。旧实现按「命中个数 / 3」，
+        # 一个四字词会连带命中多个 2/3 字子串，容易被算成 1.0——
+        # 写入查重时曾把「我住在北京」与「我住在杭州」误判为重复。
+        # 查询剖析只构造一次，候选循环里只做「关键词是否出现」的判定。
+        idf = keyword_idf((row.content or "" for row in rows), keywords)
+        profile = KeywordQuery(query, keywords, idf=idf)
         for row in rows:
-            content = row.content or ""
-            hits = sum(1 for keyword in keywords if keyword in content)
-            if hits:
-                # 词命中比例即相似度，命中 3 个词按 1.0 计
-                scored.append((row.id, min(1.0, hits / min(3, len(keywords)))))
+            score = profile.score(row.content or "")
+            if score > 0:
+                scored.append((row.id, score))
         scored.sort(key=lambda item: item[1], reverse=True)
         return scored[:limit]
 
@@ -265,6 +275,9 @@ class BuiltinVectorStore(VectorStore):
       词频 × 语料级逆文档频率（IDF 在本库全部记忆上动态统计）——
       区分度高的 token（「火锅」「橘猫」）权重放大，条条记忆都有的
       通用 token（「我」「喜欢」）权重压缩，Top-N 排序更准；
+    - **每条记忆的 IDF 加权归一化向量按代际惰性缓存**：候选打分只需
+      按查询 token（≤ ``_QUERY_TOKEN_LIMIT`` 个）查点积，复杂度与条目
+      长度无关，写入 / 删除改变 IDF 分布时自动重算；
     - **倒排索引候选裁剪**：只评分与查询共享高权重 token 的记忆，
       分区记忆量再大也不做无效全扫；
     - 向量化统一走 ``embedding_provider``（builtin/onnx/api 均可驱动，
@@ -297,6 +310,15 @@ class BuiltinVectorStore(VectorStore):
         # IDF 记忆化：语料规模不变期间同一 token 的 IDF 恒定，
         # 候选打分的逐 token 幂运算退化为字典查询（写入 / 删除时整体失效）
         self._idf_memo: dict[str, float] = {}
+        # IDF 代际号：与 _idf_memo 同步失效（写入 / 删除时递增）。用于惰性
+        # 缓存的「每条记忆 IDF 加权归一化向量」——缓存的向量依赖全库 IDF，
+        # 代际不匹配即过期，会在下次打分时按当前 IDF 重算。
+        self._idf_gen = 0
+        # item_id → (idf 代际, IDF 加权且 L2 归一化的稀疏向量)。打分时只需
+        # 遍历查询 token（≤ _QUERY_TOKEN_LIMIT 个）在该向量里查点积，复杂度
+        # 从 O(条目词数) 降到 O(查询词数)；长记忆（数百 token）批量打分时
+        # 收益最明显。原始 TF 向量仍存于 _vectors，供代际过期后重算。
+        self._weighted: dict[str, tuple[int, dict[str, float]]] = {}
         # 查询向量 LRU：多轮对话中相似提问不必重复向量化
         self._query_cache: OrderedDict[str, Any] = OrderedDict()
         self._loaded = False
@@ -344,6 +366,39 @@ class BuiltinVectorStore(VectorStore):
         value = math.log((len(self._vectors) + 1) / (self._df.get(token, 0) + 1)) + 1.0
         self._idf_memo[token] = value
         return value
+
+    def _invalidate_idf_cache(self) -> None:
+        """语料 / 文档频率变化：整体失效 IDF 记忆化，并递增加权向量代际。"""
+        self._idf_memo.clear()
+        self._idf_gen += 1
+
+    def _weighted_of(self, item_id: str) -> dict[str, float] | None:
+        """条目的 IDF 加权归一化向量（惰性计算，按代际缓存）。
+
+        打分公式 ``dot(q, e) / (|q|·|e|)`` 中 ``e/|e|`` 只依赖条目自身与当前
+        全库 IDF：预先归一化缓存后，每个候选的打分只需对查询 token（有限
+        个）做点积。代际不匹配（写入 / 删除改变了 IDF 分布）时按当前 IDF
+        重算一次并回填。
+        """
+        cached = self._weighted.get(item_id)
+        if cached is not None and cached[0] == self._idf_gen:
+            return cached[1]
+        raw = self._vectors.get(item_id)
+        if not isinstance(raw, dict):
+            return None
+        weighted: dict[str, float] = {}
+        norm2 = 0.0
+        for token, weight in raw.items():
+            term = weight * self._idf(token)
+            norm2 += term * term
+            weighted[token] = term
+        norm = math.sqrt(norm2)
+        if norm > 0.0:
+            inverse = 1.0 / norm
+            for token in weighted:
+                weighted[token] *= inverse
+        self._weighted[item_id] = (self._idf_gen, weighted)
+        return weighted
 
     def _bind_repo(self, repo: Any) -> None:
         """进程级单例跨会话复用：每次创建时刷新绑定的当前会话 repo。"""
@@ -414,9 +469,10 @@ class BuiltinVectorStore(VectorStore):
             return
         await self._ensure_loaded()
         vectors = await self._embed_many(documents)
-        self._idf_memo.clear()  # 语料规模 / 文档频率即将变化
+        self._invalidate_idf_cache()  # 语料规模 / 文档频率即将变化
         for index, item_id in enumerate(ids):
             self._unindex(item_id)  # 用旧向量回退 df / 倒排
+            self._weighted.pop(item_id, None)  # 旧加权向量随新语料失效
             metadata = dict((metadatas or [{}] * len(ids))[index])
             self._vectors[item_id] = vectors[index]
             self._metadatas[item_id] = metadata
@@ -426,22 +482,6 @@ class BuiltinVectorStore(VectorStore):
         # 稠密向量均已 L2 归一化，点积即余弦（onnx / api provider）
         raw = sum(a * b for a, b in zip(query_vector, entry_vector))
         return self._provider.calibrate(raw)
-
-    def _idf_score(
-        self, query_weighted: dict[str, float], query_norm: float, entry_vector: dict[str, float]
-    ) -> float:
-        """单遍 TF-IDF 余弦：同时累加共享项点积与条目侧 IDF 范数。"""
-        dot = 0.0
-        norm2 = 0.0
-        for token, weight in entry_vector.items():
-            term = weight * self._idf(token)
-            norm2 += term * term
-            query_term = query_weighted.get(token)
-            if query_term is not None:
-                dot += term * query_term
-        if dot <= 0.0 or norm2 <= 0.0 or query_norm <= 0.0:
-            return 0.0
-        return dot / (math.sqrt(norm2) * query_norm)
 
     async def _query_vector(self, query: str) -> Any:
         cached = self._query_cache.get(query)
@@ -453,6 +493,32 @@ class BuiltinVectorStore(VectorStore):
         while len(self._query_cache) > self._QUERY_CACHE_SIZE:
             self._query_cache.popitem(last=False)
         return vector
+
+    def _candidate_tokens(self, weighted: dict[str, float]) -> dict[str, float]:
+        """挑选用于倒排候选圈选的查询 token，避免被“我 / 的”这类泛词拖垮。
+
+        查询向量里每个 token 都参与最终打分，但圈选候选时只需要少量高区分
+        度 token：一个出现在 60% 以上记忆里的词，几乎不能缩小候选集，反而
+        会把整个分区倒排表并进来。这里按权重排序，跳过文档频率过高的词；
+        如果查询全是泛词，则退回权重最高的 3 个，保证仍有结果。
+
+        对 2000 条记忆的基准测试，这一步把“我”这类 token 的候选集从全表
+        降到真正的主题词候选，同时不改变候选记忆的最终余弦排序。
+        """
+        if not weighted:
+            return {}
+        ranked = sorted(weighted.items(), key=lambda item: item[1], reverse=True)
+        total = len(self._vectors)
+        if total <= 8:
+            return dict(ranked[: self._QUERY_TOKEN_LIMIT])
+        common_cutoff = max(8, int(total * 0.6))
+        informative = [
+            (token, weight) for token, weight in ranked
+            if self._df.get(token, 0) <= common_cutoff
+        ]
+        if not informative:
+            informative = ranked[:3]
+        return dict(informative[: self._QUERY_TOKEN_LIMIT])
 
     async def search(
         self, query: str, limit: int = 5, where: dict[str, Any] | None = None
@@ -468,7 +534,9 @@ class BuiltinVectorStore(VectorStore):
             str(clauses.get("target_id") or ""),
         )
         partition_ids: set[str] | None = None
-        if bucket_key[0] and bucket_key[2]:
+        # global 分区的 target_id 合法为空串；旧条件只看 target_id，导致全局
+        # 记忆每次都退化为全库扫描。target_type=global 时允许空 ID 走分桶。
+        if bucket_key[0] and (bucket_key[2] or bucket_key[1] == "global"):
             partition_ids = self._buckets.get(bucket_key)
             if not partition_ids:
                 return []
@@ -489,9 +557,12 @@ class BuiltinVectorStore(VectorStore):
             query_norm = math.sqrt(sum(value * value for value in weighted.values()))
             if query_norm <= 0.0:
                 return []
-            # 倒排候选裁剪：与查询共享 token 的记忆才可能得分
+            # 倒排候选裁剪：只从高区分度 token 取候选。最终打分仍使用完整
+            # weighted（包含泛词），因此不会漏掉“主题词 + 泛词”共同命中的
+            # 记忆；这里只是不把全表都拉进评分循环。
+            candidate_weighted = self._candidate_tokens(weighted)
             candidates: set[str] = set()
-            for token in weighted:
+            for token in candidate_weighted:
                 ids = self._postings.get(token)
                 if ids:
                     candidates.update(ids)
@@ -502,13 +573,18 @@ class BuiltinVectorStore(VectorStore):
                 metadata = self._metadatas.get(item_id) or {}
                 if any(metadata.get(key) != value for key, value in clauses.items()):
                     continue
-                entry_vector = self._vectors.get(item_id)
-                if not isinstance(entry_vector, dict):
+                entry_weighted = self._weighted_of(item_id)
+                if not entry_weighted:
                     continue
-                raw = self._idf_score(weighted, query_norm, entry_vector)
-                if raw <= 0.0:
+                # 归一化条目向量 + 查询侧范数：余弦只需按查询 token 查点积
+                dot = 0.0
+                for token, query_term in weighted.items():
+                    entry_term = entry_weighted.get(token)
+                    if entry_term is not None:
+                        dot += query_term * entry_term
+                if dot <= 0.0:
                     continue
-                scored.append((item_id, self._provider.calibrate(raw)))
+                scored.append((item_id, self._provider.calibrate(dot / query_norm)))
         else:
             query_vector = await self._query_vector(query)
             ids_iter = (
@@ -523,8 +599,12 @@ class BuiltinVectorStore(VectorStore):
                 if any(metadata.get(key) != value for key, value in clauses.items()):
                     continue
                 scored.append((item_id, self._dense_score(query_vector, entry_vector)))
-        scored.sort(key=lambda item: item[1], reverse=True)
-        return scored[: max(1, limit)]
+        # Top-K 用堆而不是整表排序：候选集可能有上万条，O(n·log k) 只保留前 k
+        # （k = limit）比 O(n·log n) 全排序快，且与「稳定降序取前 k」的结果一致
+        # （``nlargest`` 等价于 ``sorted(..., key=分数, reverse=True)[:k]``）。
+        return heapq.nlargest(
+            max(1, limit), scored, key=lambda item: item[1]
+        )
 
     async def update_metadata(self, ids: list[str], metadata: dict[str, Any]) -> None:
         bucket_fields = {"bot_id", "target_type", "target_id"}
@@ -540,9 +620,10 @@ class BuiltinVectorStore(VectorStore):
                 old.update(metadata)
 
     async def delete(self, ids: list[str]) -> None:
-        self._idf_memo.clear()  # 语料规模 / 文档频率即将变化
+        self._invalidate_idf_cache()  # 语料规模 / 文档频率即将变化
         for item_id in ids:
             self._unindex(item_id)  # 同步回退分桶 / df / 倒排
+            self._weighted.pop(item_id, None)  # 条目级加权向量随之删除
             self._vectors.pop(item_id, None)
             self._metadatas.pop(item_id, None)
 
@@ -552,7 +633,8 @@ class BuiltinVectorStore(VectorStore):
         self._buckets.clear()
         self._postings.clear()
         self._df.clear()
-        self._idf_memo.clear()
+        self._invalidate_idf_cache()
+        self._weighted.clear()
         self._query_cache.clear()
         self._loaded = True  # 清空后不自动回读数据库
 

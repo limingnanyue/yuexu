@@ -73,6 +73,15 @@ llm:
   thinking_hint: true
   # 上下文 + 记忆总字符上限；0 根据模型窗口扣除输出后自动计算（未知容量为6000）
   context_char_budget: 0
+  # 上下文摘要失败后的冷却时间（秒）：模型故障期间不在每轮消息里反复重试压缩
+  summary_retry_cooldown: 120
+  # 摘要合并：笔记数超过 summary_merge_batch 时按 summary_merge_chars 分批合并，
+  # 减少长会话压缩的串行模型调用次数
+  summary_merge_batch: 4
+  summary_merge_chars: 2000
+  # 上下文分段笔记的并发模型调用数：长会话压缩时多段笔记并行生成，
+  # 减少压缩占用会话写锁的时间；1 = 逐段串行（旧行为）
+  summary_note_concurrency: 2
   # 是否把搜索结果注入到 prompt
   inject_search_context: true
 
@@ -220,6 +229,9 @@ memory:
   fuzzy_keywords: ["好像", "似乎", "记得一点", "有点印象", "忘了", "想不起来", "之前", "上次", "以前", "印象中", "还记得"]
   # LLM 语义二次确认（默认关闭，避免增加对话延迟）
   fuzzy_llm_confirm: false
+  # 模糊确认的单次模型调用超时（毫秒）：该调用在召回超时约束之外，
+  # 超时会直接叠加到回复延迟，保持与模糊召回同量级的预算
+  fuzzy_llm_confirm_timeout_ms: 800
 
   # ---------- 多级召回（4.5.5） ----------
   recall_cache_ttl: 600
@@ -253,7 +265,24 @@ memory:
   write_async: true
   llm_extract: true
   extract_timeout: 8
+  # 长消息分段抽取的并发数：1 = 串行，2 适合大多数服务商；调高前先确认
+  # 模型接口的 QPS / 并发额度，避免后台抽取触发限流。
+  extract_concurrency: 2
   dedupe_threshold: 0.9
+  # 重复提及回馈：用户再次说出同一条事实时，不新增行，但小幅提升原记忆的
+  # 置信度 / 热度；按条目限频，避免刷屏写库（默认 24 小时一次）
+  duplicate_reinforce: true
+  duplicate_confidence_boost: 0.03
+  duplicate_hot_boost: 0.1
+  duplicate_reinforce_interval: 86400
+  # 身份事实自动更正：姓名 / 居住地 / 年龄 / 生日变化时作废同属性旧值，
+  # 避免「旧住址 + 新住址」同时被召回（偏好、经历不受影响）
+  supersede_enabled: true
+  # 召回热度回馈：本轮注入的记忆被成功使用后异步小幅升热，让高频记忆自然
+  # 进入热层；按条目限频，避免每轮写库
+  recall_reinforce: true
+  recall_reinforce_boost: 0.2
+  recall_reinforce_interval: 21600   # 秒：同一记忆 6 小时内最多回馈一次
 
   # ---------- 维护（4.5.10） ----------
   auto_purge_cold: false

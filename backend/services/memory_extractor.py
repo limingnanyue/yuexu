@@ -240,12 +240,20 @@ async def extract_with_llm(
     timeout: float = 8.0,
     record_date: str | None = None,
     strict_extraction: bool = False,
+    llm: Any | None = None,
+    model: Any | None = None,
 ) -> list[dict[str, Any]]:
+    """单段文本的 LLM 抽取；可复用外部已解析的模型 / LLMService。
+
+    ``llm`` / ``model`` 由 ``extract_facts`` 的并行路径传入：模型解析（3 级
+    覆盖的数据库查询）只做一次，各分段的 ``chat`` 并发执行。``LLMService.chat``
+    在传入 model 后不再访问数据库，因此共享同一个 service 是安全的。
+    """
     try:
         from backend.services.llm_service import LLMService
 
-        llm = LLMService(session)
-        model = await llm.resolve_model(bot_id, group_id)
+        llm = llm or LLMService(session)
+        model = model if model is not None else await llm.resolve_model(bot_id, group_id)
         if model is None:
             if strict_extraction:
                 raise RuntimeError("记忆提取模型不可用")
@@ -279,8 +287,50 @@ async def extract_with_llm(
         return []
 
 
+# 单次抽取请求的输入上限：约两千字一段（软上限），超过硬上限的超长单句
+# 会被强制切开，避免一整段无标点长文本被当成一个「句子」塞进模型请求。
+_EXTRACT_CHUNK_CHARS = 2000
+_EXTRACT_CHUNK_HARD_LIMIT = 4000
+
+
+def _split_long_sentence(sentence: str, limit: int) -> list[str]:
+    """把超长无标点文本按就近的空白 / 逗号 / 分号切开，兜底按长度硬切。
+
+    只在「整段都没有句末标点」时使用（粘贴的日志、代码、URL 列表、未闭合
+    引号导致的连续文本）。切点尽量落在分隔符之后，尽量不切断完整语义。
+    """
+    pieces: list[str] = []
+    start = 0
+    while start < len(sentence):
+        end = min(len(sentence), start + limit)
+        if end < len(sentence):
+            cut = max(
+                sentence.rfind(separator, start + limit // 2, end)
+                for separator in ("\n", "，", ",", "；", ";", " ", "\t")
+            )
+            if cut > start:
+                end = cut + 1  # 分隔符归前一段，保持片段可读
+        pieces.append(sentence[start:end])
+        start = end
+    return [piece for piece in pieces if piece]
+
+
 def _extraction_chunks(text: str) -> Iterator[str]:
-    """约两千字一段，保留完整句与引述，避免将假设后半句误存为事实。"""
+    """约两千字一段，保留完整句与引述，避免将假设后半句误存为事实。
+
+    边界识别：只在「引号之外」的句末标点处切分。旧实现有个漏洞——一旦出现
+    未闭合的引号（用户粘贴对话、代码、引号不平衡）或整段没有句末标点，
+    边界集合就只剩结尾一个位置，于是整段文本（可能是几十 KB）被当成一个
+    分片发给模型：输入无上限、费用与超时风险都不可控。
+
+    这里补两道上限：
+    - 累积片段超过 ``_EXTRACT_CHUNK_CHARS`` 立即切分（与原来一致）；
+    - 单句超过 ``_EXTRACT_CHUNK_HARD_LIMIT`` 时按分隔符硬切，保证单次请求
+      的输入长度有界。
+
+    同时改用列表缓冲 + ``"".join``，避免旧实现 ``chunk += sentence`` 在循环里
+    反复复制已累积内容（每个分片 O(句数²) 的字符复制）。
+    """
     quote_ends = {"“": "”", "「": "」", "『": "』", '"': '"'}
     quotes: list[str] = []
     boundaries: list[int] = []
@@ -293,17 +343,26 @@ def _extraction_chunks(text: str) -> Iterator[str]:
             boundaries.append(index + 1)
     boundaries.append(len(text))
     start = 0
-    chunk = ""
+    parts: list[str] = []
+    size = 0
     for end in boundaries:
         sentence = text[start:end]
         start = end
-        if chunk and len(chunk) + len(sentence) > 2000:
-            yield chunk
-            chunk = ""
-        # shortcut: 超长单句整体保留；需限制输入成本时应显式拒绝，不能截断事实或条件。
-        chunk += sentence
-    if chunk:
-        yield chunk
+        if not sentence:
+            continue
+        # 超长「单句」：先按分隔符硬切，逐片送入上面的软上限逻辑
+        pieces = (
+            _split_long_sentence(sentence, _EXTRACT_CHUNK_HARD_LIMIT)
+            if len(sentence) > _EXTRACT_CHUNK_HARD_LIMIT else [sentence]
+        )
+        for piece in pieces:
+            if parts and size + len(piece) > _EXTRACT_CHUNK_CHARS:
+                yield "".join(parts)
+                parts, size = [], 0
+            parts.append(piece)
+            size += len(piece)
+    if parts:
+        yield "".join(parts)
 
 
 async def extract_facts(
@@ -316,18 +375,64 @@ async def extract_facts(
     timeout: float = 8.0,
     record_date: str | None = None,
     strict_extraction: bool = False,
+    llm_concurrency: int = 1,
 ) -> list[dict[str, Any]]:
+    """分段抽取事实；长文本可并发调用模型，缩短后台写入等待。
+
+    旧实现逐段串行调用 LLM：10 段 × 8s 超时最坏要 80s，用户下一轮对话
+    可能已经结束，记忆还没落库。这里在 ``llm_concurrency>1`` 且确实有多段
+    时，先解析一次模型，再用信号量限制并发（默认 2，避免把服务商限流打满）。
+    各段结果按原始顺序合并，事实去重口径与串行路径完全一致。
+
+    单段 / 关闭 LLM 时仍走原路径，便于规则兜底与测试替身复用。
+    """
+    chunks = list(_extraction_chunks(text))
     facts: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for chunk in _extraction_chunks(text):
+
+    def merge(chunk: str, extracted: list[dict[str, Any]]) -> None:
+        # LLM 有结果时以 LLM 为准；失败 / 空结果回退规则，保持旧行为。
+        for fact in extracted or extract_by_rules(chunk, record_date=record_date):
+            if fact["content"] not in seen:
+                seen.add(fact["content"])
+                facts.append(fact)
+
+    concurrency = max(1, int(llm_concurrency))
+    if llm_enabled and concurrency > 1 and len(chunks) > 1:
+        try:
+            from backend.services.llm_service import LLMService
+
+            llm = LLMService(session)
+            model = await llm.resolve_model(bot_id, group_id)
+        except Exception:  # noqa: BLE001 - 模型解析失败退回串行 / 规则
+            if strict_extraction:
+                raise
+            model = None
+            llm = None
+        if model is not None and llm is not None:
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def run(chunk: str) -> list[dict[str, Any]]:
+                async with semaphore:
+                    return await extract_with_llm(
+                        session, chunk, bot_id=bot_id, group_id=group_id,
+                        timeout=timeout, record_date=record_date,
+                        strict_extraction=strict_extraction, llm=llm, model=model,
+                    )
+
+            # gather 保持输入顺序；strict_extraction 的异常会直接向上抛，
+            # 由恢复任务记录失败，不会静默写入半套事实。
+            extracted_chunks = await asyncio.gather(*(run(chunk) for chunk in chunks))
+            for chunk, extracted in zip(chunks, extracted_chunks, strict=True):
+                merge(chunk, extracted)
+            return facts
+
+    for chunk in chunks:
         extracted = []
         if llm_enabled:
             extracted = await extract_with_llm(
                 session, chunk, bot_id=bot_id, group_id=group_id, timeout=timeout,
                 record_date=record_date, strict_extraction=strict_extraction,
             )
-        for fact in extracted or extract_by_rules(chunk, record_date=record_date):
-            if fact["content"] not in seen:
-                seen.add(fact["content"])
-                facts.append(fact)
+        merge(chunk, extracted)
     return facts

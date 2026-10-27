@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from backend.common.cache import CacheBackend
 from backend.common.constants import CONTEXT_KEY_PATTERN
@@ -88,30 +88,85 @@ class ContextRepo:
         return None
 
     async def save(
-        self, session_key: str, data: dict[str, Any], *, append_messages: list | None = None,
+        self,
+        session_key: str,
+        data: dict[str, Any],
+        *,
+        append_messages: list | None = None,
+        archive_messages: list | None = None,
     ) -> None:
+        """保存会话快照；``archive_messages`` 中的原文追加到归档列。
+
+        写放大修复：旧实现把每条消息都追加进 ``archive`` JSON 列，并且每次保存
+        都 ``get`` 整行（``archive`` 一并反序列化）再整体重写。第 N 条消息时
+        ``archive`` 已有约 N 条原文，单条消息的写入量因此是 O(历史长度)、累计
+        O(历史长度²)，长会话下每条消息都要读写几十 KB~几 MB 的 JSON。
+
+        现在 ``archive`` 的语义是「已经移出工作窗口的原文」：
+
+        - ``archive_messages`` 由压缩流程显式传入（那批真正被裁掉的消息），
+          每条消息只会归档一次，单条消息的写入量降到 O(窗口长度)；
+          ``get_archive`` 把归档与当前窗口拼接回来，对外「全量原文」视图不变；
+        - 没有归档内容时走 Core ``UPDATE`` 只更新快照列，不再把整段 archive
+          读进内存；
+        - ``append_messages`` 保留给历史调用方（“刚刚追加了这些消息”）：这些
+          消息仍在 ``data["rounds"]`` 里，通过快照就能读回，不需要重复归档。
+          注意判断「是否仍在窗口内」必须按**对象身份**，不能按
+          ``(role, content, ts)`` 比较——同一秒内重复问同一句话会产生完全
+          相同的三元组，按内容比较会把已裁掉的消息误判成仍在窗口内而漏归档。
+        """
+        archived: list = list(archive_messages or [])
+        if archive_messages is None and append_messages:
+            # 兼容路径：只归档「已经不在快照 rounds 里」的那部分（按身份判定）
+            live = {id(item) for item in (data.get("rounds") or [])}
+            archived = [item for item in append_messages if id(item) not in live]
         if self.session_factory is not None:
             async with self.session_factory() as database:
-                row = await database.get(ContextSession, session_key)
-                if row is None:
-                    row = ContextSession(
-                        session_key=session_key, snapshot=deepcopy(data),
-                        archive=deepcopy(data.get("rounds", [])),
-                    )
-                    database.add(row)
+                if archived:
+                    # 需要追加归档：只有这条路径必须读出 archive 列
+                    row = await database.get(ContextSession, session_key)
+                    if row is None:
+                        database.add(ContextSession(
+                            session_key=session_key,
+                            snapshot=deepcopy(data),
+                            archive=deepcopy(archived),
+                        ))
+                    else:
+                        row.snapshot = deepcopy(data)
+                        row.archive = [*(row.archive or []), *deepcopy(archived)]
                 else:
-                    row.snapshot = deepcopy(data)
-                    if append_messages:
-                        # shortcut: 原文 JSON 每次追加重写，超长会话应改用逐条消息表。
-                        row.archive = [*(row.archive or []), *deepcopy(append_messages)]
+                    # 常见路径（每条消息）：只写快照列，不触碰 archive
+                    saved = await database.execute(
+                        update(ContextSession)
+                        .where(ContextSession.session_key == session_key)
+                        .values(snapshot=deepcopy(data))
+                    )
+                    if not saved.rowcount:
+                        database.add(ContextSession(
+                            session_key=session_key,
+                            snapshot=deepcopy(data),
+                            archive=[],
+                        ))
                 await database.commit()
         await self.cache.set_json(session_key, data, ttl=self.ttl)
 
     async def get_archive(self, session_key: str) -> list:
+        """全量原文 = 已归档（离开窗口）的原文 + 当前窗口内的原文。
+
+        两者按时间先后天然有序：归档总是更早的消息，拼接后与旧版「逐条消息
+        全部归档」的结果一致，但归档列不再需要随每条消息重写。
+        """
         if self.session_factory is not None:
             async with self.session_factory() as database:
-                row = await database.get(ContextSession, session_key)
-                return deepcopy(row.archive) if row is not None else []
+                row = (await database.execute(
+                    select(ContextSession.archive, ContextSession.snapshot)
+                    .where(ContextSession.session_key == session_key)
+                )).first()
+                if row is None:
+                    return []
+                archive = deepcopy(row[0] or [])
+                rounds = deepcopy((row[1] or {}).get("rounds") or [])
+                return [*archive, *rounds]
         return list((await self.get(session_key) or {}).get("rounds") or [])
 
     async def _get_many(self, keys: list[str]) -> list[dict[str, Any] | None]:

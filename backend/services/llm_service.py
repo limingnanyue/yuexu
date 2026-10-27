@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.common.exceptions import LLMError, NotFoundError, ValidationError
 from backend.common.logger import get_logger
-from backend.common.utils import truncate
+from backend.common.utils import estimate_message_tokens, estimate_text_tokens, truncate
 from backend.core.config_loader import get_config
 from backend.database.models import LlmModel
 from backend.repositories.account_repo import AccountRepo
@@ -318,13 +318,23 @@ class LLMService:
     def input_char_budget(
         self, model: LlmModel | None, *, char_cap: int | None = None,
     ) -> int:
-        """模型窗口扣除输出与消息开销；显式字符上限仍可限制费用。"""
+        """模型窗口扣除输出与消息开销后的字符预算。
+
+        旧实现按「4 个字符 ≈ 1 token」把 token 折算成字符，对中文场景等于把
+        可用上下文压到三分之一：8k 窗口只剩约 1.7k 字历史，长对话很快被摘要
+        顶掉。这里改用 ``estimate_text_tokens`` 同一套口径——汉字约 1 token、
+        其他字符约 0.3 token——字符预算取「最坏情况全中文」，再留 10% 余量。
+        显式配置的 ``llm.context_char_budget`` 仍然优先（限制费用 / 保持旧行为）。
+        """
         cap = int(self.config.get("llm.context_char_budget", 0) if char_cap is None else char_cap)
         window = (model.extra or {}).get("context_window") if model else None
         if type(window) is not int or window <= 0:
             return cap if cap > 0 else 6000
-        # shortcut: 未配置模型专用 tokenizer，以每字符最多四个 UTF-8 字节保守预留。
-        budget = max(1, (window - int(model.max_tokens or 1024) - 256) // 4)
+        # 预留输出上限与固定开销（系统消息、角色标记、工具定义）
+        available = max(1, window - int(model.max_tokens or 1024) - 256)
+        # 每 1 token 按 1 个汉字估（中文最坏情况），再留 10% 安全余量：
+        # 低估会触发服务商 400 错误，高估则浪费窗口，这里取偏保守的一侧。
+        budget = max(1, int(available * 0.9))
         return min(cap, budget) if cap > 0 else budget
 
     @staticmethod
@@ -332,18 +342,20 @@ class LLMService:
         messages: list[dict[str, Any]], window: int, output_tokens: int,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]] | None:
-        """每个实际请求独立校验窗口，备用模型更小时仅移除最旧完整轮次。"""
+        """每个实际请求独立校验窗口，备用模型更小时仅移除最旧完整轮次。
+
+        窗口校验用 ``estimate_message_tokens``（汉字 1 token、其他字符 0.3
+        token）代替旧的 UTF-8 字节数：字节数对中文高估约 3 倍，会把本来放得
+        下的历史轮次误判为超限。工具定义仍按 JSON 字节数折算，保持保守。
+        """
         def cost(message):
-            content = message.get("content") or ""
-            if isinstance(content, list):
-                size = sum(
-                    len(str(part.get("text") or "").encode("utf-8"))
-                    if part.get("type") == "text" else 4096
-                    for part in content if isinstance(part, dict)
+            size = estimate_message_tokens(message.get("content"))
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                size += estimate_text_tokens(
+                    json.dumps(tool_calls, ensure_ascii=False)
                 )
-            else:
-                size = len(str(content).encode("utf-8"))
-            return size + 16 + len(json.dumps(message.get("tool_calls") or [], ensure_ascii=False).encode("utf-8"))
+            return size
 
         available = window - output_tokens - 256
         if tools:
@@ -536,17 +548,37 @@ class LLMService:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMReply:
-        """三级降级：可重试错误重试一次 → 备用模型 → 兜底话术。"""
+        """三级降级：可重试错误重试一次 → 备用模型 → 兜底话术。
+
+        超时单独处理：一次超时已经把整个 ``timeout``（默认 60s）耗完，用同一
+        个模型再试一次通常是「再等一个 60s」，用户侧表现为机器人长时间不回。
+        因此当**配置了备用模型**时，超时直接切备用模型，不再重试主模型；
+        没有备用模型时保持原有的一次重试，避免单次网络抖动变成兜底话术。
+        """
         if model is None:
             model = await self.resolve_model(bot_id, group_id)
         tool_options = {"tools": tools, "tool_choice": tool_choice} if tools else {}
         reply = await self.chat(messages, model=model, **tool_options)
-        if not reply.success and reply.retryable:
+        fallback_model: LlmModel | None = None
+        if not reply.success:
+            fallback_model = await self._fallback_model()
+        # 超时且配置了另一个备用模型 → 跳过主模型重试，直接进入备用模型分支
+        skip_same_retry = bool(
+            not reply.success
+            and reply.retryable
+            and "超时" in str(reply.error or "")
+            and fallback_model is not None
+            and fallback_model.id != reply.model_id
+        )
+        if skip_same_retry:
+            logger.warning("LLM 主模型超时，直接切换备用模型：%s", fallback_model.model_name)
+        elif not reply.success and reply.retryable:
             logger.warning("LLM 首次调用失败（%s），0.5s 后重试一次", reply.error)
             await asyncio.sleep(0.5)
             reply = await self.chat(messages, model=model, **tool_options)
         if not reply.success:
-            fallback_model = await self._fallback_model()
+            if fallback_model is None:
+                fallback_model = await self._fallback_model()
             if fallback_model is not None and fallback_model.id != reply.model_id:
                 logger.warning(
                     "LLM 主模型不可用，切换备用模型：%s", fallback_model.model_name

@@ -130,7 +130,7 @@ class MemoryRepo(BaseRepository):
         if exclude_rejected:
             conditions.append(MemoryEntry.rejected.is_(False))
         if created_after is not None:
-            conditions.append(MemoryEntry.created_at >= created_at)
+            conditions.append(MemoryEntry.created_at >= created_after)
         stmt = (
             select(MemoryEntry)
             .where(*conditions)
@@ -247,6 +247,46 @@ class MemoryRepo(BaseRepository):
             limit=limit,
         )
 
+    async def identity_candidates(
+        self,
+        bot_id: str,
+        *,
+        target_type: str,
+        target_id: str,
+        user_id: str,
+        group_id: str | None = None,
+        limit: int = 200,
+    ) -> list[MemoryEntry]:
+        """身份属性候选（姓名 / 住址 / 年龄 / 生日），供新值覆盖旧值。
+
+        旧实现只看最近 60 条；用户聊了几十轮日常后再搬家，旧住址可能已经
+        被挤出窗口，导致新旧地址同时可召回。这里先用 SQL 圈出“可能含身份
+        属性”的条目（数量远小于全部记忆），再交给 ``identity_fact`` 精确
+        解析；索引仍可走 target 复合索引，写入路径开销可控。
+        """
+        conditions = self._scope_conditions(
+            bot_id,
+            target_type=target_type,
+            target_id=target_id,
+            user_id=user_id,
+            group_id=group_id,
+            scope_type="group" if group_id else "private",
+        )
+        conditions.append(MemoryEntry.rejected.is_(False))
+        patterns = (
+            "%我叫%", "%我的名字%", "%名字是%", "%住在%", "%家在%",
+            "%来自%", "%岁%", "%生日%",
+        )
+        conditions.append(or_(*(MemoryEntry.content.like(pattern) for pattern in patterns)))
+        stmt = (
+            select(MemoryEntry)
+            .where(*conditions)
+            .order_by(MemoryEntry.created_at.desc())
+            .limit(max(1, limit))
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     # ------------------------------------------------------------------
     # 批量更新 / 维护
     # ------------------------------------------------------------------
@@ -271,7 +311,9 @@ class MemoryRepo(BaseRepository):
             update(MemoryEntry)
             .where(MemoryEntry.hot_score > 0)
             .values(hot_score=MemoryEntry.hot_score * factor)
-            .execution_options(synchronize_session=False)
+            # evaluate：已加载对象的 hot_score 同步改成新值。用 False 时旧值会留在
+            # 会话里，下一次 flush 覆盖回数据库，热度衰减就静默失效了。
+            .execution_options(synchronize_session="evaluate")
         )
         result = await self.session.execute(stmt)
         await self.session.flush()
